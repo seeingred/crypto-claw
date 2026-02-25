@@ -117,22 +117,24 @@ RESPONSE:
 The TX analyzer is the sole validation layer on Party B. It combines deterministic checks with LLM-based reasoning:
 
 - **Deterministic checks** (always run first):
-  - Decodes calldata against known contract ABIs (configured on secure server)
-  - Verifies function selectors match known methods on the target contract
+  - Fetches contract ABI automatically from block explorers (Etherscan, Solscan, etc.) or on-chain metadata
+  - Caches fetched ABIs locally to avoid repeated lookups
+  - Decodes calldata using the fetched ABI
   - Validates parameter encoding and types
-  - Checks destination addresses against known contracts/wallets
+  - If ABI cannot be fetched (unverified contract), flags as higher risk
   - Verifies derivation path is expected
 
-- **LLM-based analysis** (run after deterministic checks pass):
+- **LLM-based analysis** (run after deterministic checks):
   - Connects to an LLM API (OpenAI, Anthropic, or a locally-hosted model — configurable, model runtime itself is out of scope)
-  - Provides decoded transaction context to the LLM for intent classification
+  - Receives decoded transaction context (or raw calldata if ABI unavailable) for intent classification
+  - Considers risk signals (unverified contract, unusual parameters, large values)
   - Outputs confidence score and classification
   - Decision matrix:
     - High confidence + expected pattern → auto-approve → co-sign
-    - Low confidence or unusual pattern → escalate to user
+    - Low confidence, unusual pattern, or unverified contract → escalate to user
     - Clearly malicious or nonsensical → reject
 
-- **Configuration**: known contract ABIs, trusted addresses, and LLM connection settings stored as config files on the secure server, editable only with direct access.
+- **Configuration**: LLM connection settings and block explorer API keys stored as config files on the secure server, editable only with direct access. No manual ABI curation needed.
 
 **User Escalation**:
 
@@ -198,9 +200,8 @@ The setup is driven by the **Installer** (see below) running on a local machine.
    - Public keys are output for on-chain wallet registration
 
 3. Configure TX analyzer on secure server
-   - Add known contract ABIs
-   - Set trusted addresses
    - Configure LLM connection (API key + endpoint)
+   - Configure block explorer API keys (Etherscan, Solscan, etc.)
    - Configure escalation channel (Telegram bot token + chat ID)
 
 4. Deploy via SSH
@@ -276,7 +277,7 @@ A setup wizard that runs on a local machine (not on either server). Provides a s
   - Generates EdDSA master (ed25519) for Solana etc.
   - Displays seed phrases for user to copy and save securely
 - LLM setup for tx analyzer
-- **Telegram bot se>tup**: provides instructions, prompts for bot token, authorizes one recipient user
+- **Telegram bot setup**: provides instructions, prompts for bot token, authorizes one recipient user
 
 - **Deployment**: installs Party A and Party B software on configured servers via SSH
 - **Service management**: configures both services to run on boot (systemd)
