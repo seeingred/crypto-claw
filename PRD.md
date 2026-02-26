@@ -365,3 +365,33 @@ A web dashboard served by Party A for operational visibility.
 4. **Party setup**: 2-of-2 (Party A on AI server, Party B on secure server)
 5. **Broadcasting**: Bot's responsibility (Party A returns signed tx, bot decides to broadcast)
 6. **Transaction validation**: AI-driven TX analyzer with deterministic ABI checks (no separate policy engine)
+
+
+## User stories
+
+User installs the software:
+- I'm running the installer via bash script working on mac, linux and WSL
+- It shows web view in my default browser
+- It explains me that I need one ai server, where I'm going to run openclaw or similiar ai bot. Also I need a secure server which should run nothing else but other piece of software
+- When I proceed it promts me ssh access to poth server, where I can provide ssh creds and / or keys to access it (it also can provide optional localhost installation for testing purposes)
+- When I proceed It generates two master (extended private keys), display seed prases and promt me to copy and save it somewhere in secure space. Before moving to the next step it warns me that without the procate keys I can not recovery wallets etc
+- Next steps is asking me to provide open ai key, anthropic key or locally hosted model, and select a moderl in case open ai and anthropic (via api)
+- Next step provides instructions and prompt me for bot token obtained from bot father and, which secure server gonna use
+- NExt steps should wait for the first message to this bot and then autorize this telegram user as solo actor who is autorized sent messages to the bot
+- After all this setting I'm reviewing then and if I press ok, istallation is proceeded
+- After installation is done (with clear installation logs displayed and progress bar), both servers should be setup and be functional. Installer should provide link to webiview of ai-server
+
+Bot communicates with ai-server:
+- As a bot I can derive public key and address for supported chain
+- As a bot I can view all derived public keys and addresses
+- As a bot I can request raw transaction to be sign and as return receive signed transaction.
+- If transaction is sent user to review As a bot I will recieve the id of transaction and can later check if it's been approved and ai servr should return me this transaction and then delete the transaction from memory
+- As a bot I can check the health of ai-server
+
+User communicates to secure-server via bot
+- I should receive a promt to confirm or deny a transaction of all possible details which can help me make educated decision
+- I should press the reject or approve button on this promt to reject or approve signing of such transaction
+
+Readme:
+- I as a user should be able to read comprehensive readme about the systems in repo.
+
