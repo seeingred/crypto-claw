@@ -53,18 +53,28 @@ The AI bot is **out of scope** — it is a consumer of this system via a local A
 **API** (localhost only, not exposed to network):
 
 ```
+POST /derive
+{
+  "derivationPath": "m/44'/60'/0'/0/0"
+}
+→ { "address": "0x...", "pubKey": "0x..." }
+
 POST /sign
 {
-  "vm": "evm" | "solana" | "tendermint",
-  "chain": "<ticker of the chain>",
   "unsignedTx": "<base64 encoded unsigned transaction>",
   "to": ["<address>"],
   "derivationPath": "m/44'/60'/0'/0/0"
 }
-→ { "signedTx": "<base64 encoded signed transaction>", "status": "signed" }
+→ { "signedTx": "<base64>", "status": "signed" }
+   // If escalated to user for review:
+→ { "txId": "<uuid>", "status": "pending_review" }
+
+GET /sign/:txId
+→ { "txId": "...", "status": "pending_review" | "approved" | "rejected", "signedTx": "<base64, if approved>", "derivationPath": "m/44'/60'/0'/0/0" }
+   // Once the bot retrieves an approved transaction, it is deleted from memory
 
 GET /keys
-→ { "chains": { "eth": { "address": "0x...", "pubKey": "0x..." }, "sol": { "address": "So1...", "pubKey": "..." }, ... } }
+→ { "keys": { "m/44'/60'/0'/0/0": { "address": "0x...", "pubKey": "0x..." }, "m/44'/501'/0'/0'": { "address": "So1...", "pubKey": "..." }, ... } }
 
 GET /health
 → { "status": "ok", "secureServerConnected": true }
@@ -75,9 +85,11 @@ GET /health
 - VM adapters: construct unsigned transactions per VM
 - Manage nonces and sequence numbers
 - Derive child key shares for requested chain (HD derivation via tss-lib)
+- On-demand key derivation via `/derive` endpoint
 - Initiate TSS signing protocol with Party B
 - Assemble final signed transaction
 - Return signed transaction to the bot (bot decides whether and when to broadcast)
+- Queue escalated transactions, serve status via `/sign/:txId`, delete after bot retrieval
 - Store and serve public key / address / derivation path info
 - Serve web UI for viewing keys and transaction history
 
@@ -226,10 +238,15 @@ The setup is driven by the **Installer** (see below) running on a local machine.
 6.  Party B:        TX analyzer runs LLM analysis (if checks pass)
 7.  Party B:        Decision: approve / reject / escalate
 8.  If rejected:    Party A returns error to bot
-9.  If escalated:   Party B notifies user via Telegram, waits for response
+9.  If escalated:   Party B sends Telegram notification with tx details + Approve/Reject buttons
+                    Party A returns { txId, status: "pending_review" } to bot
+                    Bot polls GET /sign/:txId until resolved
+                    User approves/rejects via Telegram
+                    On approval: TSS signing proceeds, signed tx stored for bot retrieval
+                    On rejection or timeout: status updated to "rejected"
 10. If approved:    Both parties run TSS signing protocol
 11. Party A:        Assembles signed transaction
-12. Party A → Bot:  Returns signed transaction
+12. Party A → Bot:  Returns signed transaction (or stores for poll retrieval if escalated)
 13. Bot:            Validates, decides whether to broadcast to chain
 ```
 
@@ -259,7 +276,7 @@ The setup is driven by the **Installer** (see below) running on a local machine.
 | TSS library | [bnb-chain/tss-lib](https://github.com/bnb-chain/tss-lib) | Supports ECDSA + EdDSA, most battle-tested, patched for known vulns |
 | Transport | mutual TLS over TCP | Authenticated, encrypted, no middleware needed |
 | API (Party A) | HTTP REST on localhost | Simple for bot integration |
-| TX analyzer config | YAML/JSON files | ABIs, trusted addresses, version-controllable |
+| TX analyzer config | YAML/JSON files | LLM settings, block explorer API keys, version-controllable |
 | Chain RPCs | Configurable endpoints | Each adapter gets its own RPC URL config |
 | Key storage | Encrypted in Postgres | Each party's share + aux data, encrypted at rest |
 | LLM (TX analyzer) | OpenAI / Anthropic / local model API | Configurable endpoint, model runtime out of scope |
@@ -268,19 +285,21 @@ The setup is driven by the **Installer** (see below) running on a local machine.
 
 ## Installer
 
-A setup wizard that runs on a local machine (not on either server). Provides a step-by-step web UI to bootstrap the entire system.
+A setup wizard that runs on a local machine (not on either server). Launched via a bash script that works on macOS, Linux, and WSL. Distributable as a one-liner install from GitHub (e.g. `curl -fsSL https://raw.githubusercontent.com/.../install.sh | bash`). Opens a step-by-step web UI in the user's default browser.
 
-- **Local web UI** with a guided wizard flow
-- **SSH connection** to both servers (supports password and pubkey auth)
-- **DKG ceremony orchestration**:
-  - Generates ECDSA master (secp256k1) for EVM and Cosmos chains
-  - Generates EdDSA master (ed25519) for Solana etc.
-  - Displays seed phrases for user to copy and save securely
-- LLM setup for tx analyzer
-- **Telegram bot setup**: provides instructions, prompts for bot token, authorizes one recipient user
+**Wizard steps**:
+1. **Welcome & explanation**: describes the two-server architecture (AI server + secure server) and what each does
+2. **Server configuration**: prompts for SSH access to both servers (supports password and pubkey auth). Offers optional localhost installation for testing
+3. **Key generation (DKG)**: generates ECDSA master (secp256k1) for EVM/Cosmos and EdDSA master (ed25519) for Solana. Displays seed phrases for user to copy and save. Warns that keys cannot be recovered without them before proceeding
+4. **LLM setup**: prompts for OpenAI key, Anthropic key, or locally-hosted model endpoint. Allows model selection for OpenAI/Anthropic
+5. **Telegram bot setup**: provides BotFather instructions, prompts for bot token
+6. **Telegram user authorization**: waits for the first message to the bot, then authorizes that user as the sole authorized recipient
+7. **Review & confirm**: displays all configured settings for review before proceeding
+8. **Deployment**: installs Party A and Party B on servers via SSH, with live installation logs and progress bar. Configures both as systemd services to run on boot
+9. **Done**: shows completion status and link to the AI server web UI
 
-- **Deployment**: installs Party A and Party B software on configured servers via SSH
-- **Service management**: configures both services to run on boot (systemd)
+**Uninstaller**: a separate bash script (also distributable via `curl | bash`) that connects to the servers via SSH, stops the services, removes installed software, cleans up systemd configurations, and deletes key shares from Postgres. Prompts for confirmation before proceeding.
+
 - **Stack**: Tailwind CSS
 - **Design**: clean, modern UI with dark and light mode (defaults to system preference)
 
@@ -290,7 +309,7 @@ A setup wizard that runs on a local machine (not on either server). Provides a s
 
 A web dashboard served by Party A for operational visibility.
 
-- **Keys & addresses**: view all generated addresses, public keys, and derivation paths
+- **Keys & addresses**: view all generated addresses, public keys, and derivation paths. Derivation paths are mapped to human-readable chain names (e.g. `m/44'/60'/...` → "Ethereum", `m/44'/501'/...` → "Solana")
 - **Transaction history**: view all signing request history with statuses (signed, rejected, escalated, pending)
 - **Stack**: Tailwind CSS
 - **Design**: clean, modern UI with dark and light mode (defaults to system preference)
@@ -367,31 +386,31 @@ A web dashboard served by Party A for operational visibility.
 6. **Transaction validation**: AI-driven TX analyzer with deterministic ABI checks (no separate policy engine)
 
 
-## User stories
+## User Stories
 
-User installs the software:
-- I'm running the installer via bash script working on mac, linux and WSL
-- It shows web view in my default browser
-- It explains me that I need one ai server, where I'm going to run openclaw or similiar ai bot. Also I need a secure server which should run nothing else but other piece of software
-- When I proceed it promts me ssh access to poth server, where I can provide ssh creds and / or keys to access it (it also can provide optional localhost installation for testing purposes)
-- When I proceed It generates two master (extended private keys), display seed prases and promt me to copy and save it somewhere in secure space. Before moving to the next step it warns me that without the procate keys I can not recovery wallets etc
-- Next steps is asking me to provide open ai key, anthropic key or locally hosted model, and select a moderl in case open ai and anthropic (via api)
-- Next step provides instructions and prompt me for bot token obtained from bot father and, which secure server gonna use
-- NExt steps should wait for the first message to this bot and then autorize this telegram user as solo actor who is autorized sent messages to the bot
-- After all this setting I'm reviewing then and if I press ok, istallation is proceeded
-- After installation is done (with clear installation logs displayed and progress bar), both servers should be setup and be functional. Installer should provide link to webiview of ai-server
+### User installs the software
+- I run the installer via a bash script that works on macOS, Linux, and WSL
+- It opens a web UI in my default browser
+- It explains that I need two servers: an AI server (where I'll run OpenClaw or a similar AI bot) and a secure server (which should run nothing else but the co-signer software)
+- When I proceed, it prompts me for SSH access to both servers, where I can provide SSH credentials and/or keys (it also offers an optional localhost installation for testing purposes)
+- When I proceed, it generates two master extended private keys (ECDSA + EdDSA), displays seed phrases, and prompts me to copy and save them in a secure location. Before moving to the next step, it warns me that without the private keys I cannot recover the wallets
+- Next step asks me to provide an OpenAI key, Anthropic key, or a locally-hosted model endpoint, and select a model in case of OpenAI or Anthropic (via API)
+- Next step provides instructions for creating a Telegram bot via BotFather, and prompts me for the bot token
+- Next step waits for the first message to this Telegram bot, then authorizes that Telegram user as the sole actor authorized to send messages to the bot
+- After all settings are configured, I review them and press OK to proceed with installation
+- After installation completes (with clear installation logs and a progress bar), both servers are set up and functional. The installer provides a link to the web UI of the AI server
 
-Bot communicates with ai-server:
-- As a bot I can derive public key and address for supported chain
-- As a bot I can view all derived public keys and addresses
-- As a bot I can request raw transaction to be sign and as return receive signed transaction.
-- If transaction is sent user to review As a bot I will recieve the id of transaction and can later check if it's been approved and ai servr should return me this transaction and then delete the transaction from memory
-- As a bot I can check the health of ai-server
+### Bot communicates with AI server
+- As a bot, I can derive a public key and address for any supported chain
+- As a bot, I can view all derived public keys and addresses
+- As a bot, I can request a raw transaction to be signed and receive the signed transaction in return
+- If a transaction is escalated to the user for review, I receive a transaction ID and can poll later to check if it's been approved or rejected. Once approved, the AI server returns the signed transaction and then deletes it from memory
+- As a bot, I can check the health of the AI server
 
-User communicates to secure-server via bot
-- I should receive a promt to confirm or deny a transaction of all possible details which can help me make educated decision
-- I should press the reject or approve button on this promt to reject or approve signing of such transaction
+### User communicates with secure server via Telegram
+- I receive a prompt to confirm or deny a transaction, with all available details to help me make an educated decision (decoded calldata, destination address, value, risk assessment)
+- I press the Reject or Approve button on this prompt to reject or approve signing of the transaction
 
-Readme:
-- I as a user should be able to read comprehensive readme about the systems in repo.
+### Documentation
+- As a user, I can read a comprehensive README in the repo that explains the system architecture, setup instructions, and API reference
 
