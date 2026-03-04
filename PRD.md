@@ -55,9 +55,16 @@ The AI bot is **out of scope** — it is a consumer of this system via a local A
 ```
 POST /derive
 {
-  "derivationPath": "m/44'/60'/0'/0/0"
+  "derivationPath": "m/44'/60'/0'/0/0",
+  "label": "<optional, human-readable label>"
 }
 → { "address": "0x...", "pubKey": "0x..." }
+
+PUT /keys/:derivationPath/label
+{
+  "label": "My ETH trading wallet"
+}
+→ { "ok": true }
 
 POST /sign
 {
@@ -74,7 +81,7 @@ GET /sign/:txId
    // Once the bot retrieves an approved transaction, it is deleted from memory
 
 GET /keys
-→ { "keys": { "m/44'/60'/0'/0/0": { "address": "0x...", "pubKey": "0x..." }, "m/44'/501'/0'/0'": { "address": "So1...", "pubKey": "..." }, ... } }
+→ { "keys": { "m/44'/60'/0'/0/0": { "address": "0x...", "pubKey": "0x...", "label": "My ETH trading wallet" }, "m/44'/501'/0'/0'": { "address": "So1...", "pubKey": "...", "label": "" }, ... } }
 
 GET /health
 → { "status": "ok", "secureServerConnected": true }
@@ -146,11 +153,13 @@ The TX analyzer is the sole validation layer on Party B. It combines determinist
     - Low confidence, unusual pattern, or unverified contract → escalate to user
     - Clearly malicious or nonsensical → reject
 
+- **Manual confirmation mode**: TX analyzer can be fully disabled via a toggle button in the Telegram bot settings menu. When disabled, all transactions are routed directly to the user for manual approval via Telegram. Useful when the user wants to approve transactions the analyzer would otherwise reject (e.g. sending funds to a new wallet).
+
 - **Configuration**: LLM connection settings and block explorer API keys stored as config files on the secure server, editable only with direct access. No manual ABI curation needed.
 
 **User Escalation**:
 
-- When TX analyzer is uncertain, notification sent to user via Telegram bot
+- When TX analyzer is uncertain (or manual mode is enabled), notification sent to user via Telegram bot
 - User can approve or reject via Telegram
 - Escalated transactions are queued, not dropped
 - Configurable timeout: if user doesn't respond within X minutes, default to reject
@@ -217,9 +226,9 @@ The setup is driven by the **Installer** (see below) running on a local machine.
    - Configure escalation channel (Telegram bot token + chat ID)
 
 4. Deploy via SSH
-   - Installer deploys Party A to AI server
-   - Installer deploys Party B to secure server
-   - Both services configured to run on boot
+   - Installer deploys Party A as a Docker container to AI server
+   - Installer deploys Party B as a Docker container to secure server
+   - Both containers configured to restart on boot
 
 
 5. Both services switch to "operational mode"
@@ -280,6 +289,8 @@ The setup is driven by the **Installer** (see below) running on a local machine.
 | Chain RPCs | Configurable endpoints | Each adapter gets its own RPC URL config |
 | Key storage | Encrypted in Postgres | Each party's share + aux data, encrypted at rest |
 | LLM (TX analyzer) | OpenAI / Anthropic / local model API | Configurable endpoint, model runtime out of scope |
+| Deployment | Docker | Both services run as Docker containers on their respective servers |
+| Frontend | Svelte + Tailwind CSS | Installer wizard and AI server web UI |
 
 ---
 
@@ -295,12 +306,12 @@ A setup wizard that runs on a local machine (not on either server). Launched via
 5. **Telegram bot setup**: provides BotFather instructions, prompts for bot token
 6. **Telegram user authorization**: waits for the first message to the bot, then authorizes that user as the sole authorized recipient
 7. **Review & confirm**: displays all configured settings for review before proceeding
-8. **Deployment**: installs Party A and Party B on servers via SSH, with live installation logs and progress bar. Configures both as systemd services to run on boot
+8. **Deployment**: installs Party A and Party B as Docker containers on servers via SSH, with live installation logs and progress bar. Configures both as Docker services to run on boot
 9. **Done**: shows completion status and link to the AI server web UI
 
-**Uninstaller**: a separate bash script (also distributable via `curl | bash`) that connects to the servers via SSH, stops the services, removes installed software, cleans up systemd configurations, and deletes key shares from Postgres. Prompts for confirmation before proceeding.
+**Uninstaller**: a separate bash script (also distributable via `curl | bash`) that connects to the servers via SSH, stops and removes Docker containers, removes images, cleans up volumes, and deletes key shares from Postgres. Prompts for confirmation before proceeding.
 
-- **Stack**: Tailwind CSS
+- **Stack**: Svelte + Tailwind CSS
 - **Design**: clean, modern UI with dark and light mode (defaults to system preference)
 
 ---
@@ -311,7 +322,7 @@ A web dashboard served by Party A for operational visibility.
 
 - **Keys & addresses**: view all generated addresses, public keys, and derivation paths. Derivation paths are mapped to human-readable chain names (e.g. `m/44'/60'/...` → "Ethereum", `m/44'/501'/...` → "Solana")
 - **Transaction history**: view all signing request history with statuses (signed, rejected, escalated, pending)
-- **Stack**: Tailwind CSS
+- **Stack**: Svelte + Tailwind CSS
 - **Design**: clean, modern UI with dark and light mode (defaults to system preference)
 
 ---
@@ -401,15 +412,17 @@ A web dashboard served by Party A for operational visibility.
 - After installation completes (with clear installation logs and a progress bar), both servers are set up and functional. The installer provides a link to the web UI of the AI server
 
 ### Bot communicates with AI server
-- As a bot, I can derive a public key and address for any supported chain
-- As a bot, I can view all derived public keys and addresses
+- As a bot, I can derive a public key and address for any supported chain, optionally attaching a label (e.g. "Main trading wallet")
+- As a bot, I can update labels on existing derivation paths and addresses
+- As a bot, I can view all derived public keys, addresses, and their labels
 - As a bot, I can request a raw transaction to be signed and receive the signed transaction in return
 - If a transaction is escalated to the user for review, I receive a transaction ID and can poll later to check if it's been approved or rejected. Once approved, the AI server returns the signed transaction and then deletes it from memory
 - As a bot, I can check the health of the AI server
 
 ### User communicates with secure server via Telegram
-- I receive a prompt to confirm or deny a transaction, with all available details to help me make an educated decision (decoded calldata, destination address, value, risk assessment)
-- I press the Reject or Approve button on this prompt to reject or approve signing of the transaction
+- I receive a message with transaction details (decoded calldata, destination address, value, risk assessment) and two inline buttons: **Approve** and **Reject**
+- I tap Approve or Reject to approve or reject signing of the transaction
+- I can open a **Settings** menu (via a persistent menu button) which has a toggle button to switch between **Auto mode** (TX analyzer decides, escalates uncertain txs) and **Manual mode** (all transactions sent to me for approval)
 
 ### Documentation
 - As a user, I can read a comprehensive README in the repo that explains the system architecture, setup instructions, and API reference
