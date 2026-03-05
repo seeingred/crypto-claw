@@ -12,6 +12,27 @@ go run ./cmd/installer
 
 Opens the installer wizard at http://localhost:3000. The Svelte UI is pre-built and embedded in the Go binary — no Node.js needed.
 
+### Build a standalone binary
+
+```bash
+# Build the frontend (requires Node.js 18+, only needed if you modify the UI)
+cd installer/ui && npm install && npm run build && cd ../..
+cp -r installer/ui/dist/* cmd/installer/ui/dist/
+
+# Build the Go binary (embeds the UI via go:embed)
+go build -o crypto-claw-installer ./cmd/installer
+```
+
+Run it:
+
+```bash
+./crypto-claw-installer                  # default port 3000
+./crypto-claw-installer -port 8888       # custom port
+./crypto-claw-installer -no-browser      # don't auto-open browser
+```
+
+If you haven't changed the Svelte UI, skip the frontend build — the pre-built `cmd/installer/ui/dist/` is already committed.
+
 ### Remote install (no repo checkout)
 
 ```bash

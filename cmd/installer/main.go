@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"runtime"
+	"time"
 )
 
 //go:embed all:ui/dist
@@ -20,11 +22,10 @@ func main() {
 	noBrowser := flag.Bool("no-browser", false, "skip auto-opening browser")
 	flag.Parse()
 
-	slog.Info("Crypto Claw Installer", "port", *port)
-
 	state := &WizardState{
 		Step: "welcome",
 	}
+	state.StartPreParamGeneration()
 
 	mux := http.NewServeMux()
 
@@ -34,8 +35,12 @@ func main() {
 	// Serve embedded frontend.
 	mux.Handle("/", frontendHandler())
 
-	addr := fmt.Sprintf("127.0.0.1:%d", *port)
-	url := fmt.Sprintf("http://%s", addr)
+	ln, err := findAvailableListener(*port)
+	if err != nil {
+		slog.Error("no available port", "error", err)
+		os.Exit(1)
+	}
+	url := fmt.Sprintf("http://%s", ln.Addr().String())
 
 	if !*noBrowser {
 		go openBrowser(url)
@@ -45,11 +50,10 @@ func main() {
 	fmt.Printf("\n  Crypto Claw Installer\n  %s\n\n", url)
 
 	server := &http.Server{
-		Addr:    addr,
 		Handler: corsMiddleware(mux),
 	}
 
-	if err := server.ListenAndServe(); err != nil {
+	if err := server.Serve(ln); err != nil {
 		slog.Error("server error", "error", err)
 		os.Exit(1)
 	}
@@ -141,6 +145,54 @@ func corsMiddleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+// findAvailableListener tries the preferred port first, then falls back to
+// sequential ports, and finally to an OS-assigned port. It returns an open
+// listener to avoid TOCTOU races.
+//
+// A port is considered busy if we can either connect to it (something is
+// already serving there) or if net.Listen fails. This handles the case where
+// another process binds to [::]:port (IPv6 wildcard) while 127.0.0.1:port
+// appears technically available — the browser would still reach the other
+// process.
+func findAvailableListener(preferred int) (net.Listener, error) {
+	candidates := []int{preferred}
+	for p := preferred + 1; p < preferred+20; p++ {
+		candidates = append(candidates, p)
+	}
+
+	for _, p := range candidates {
+		if portInUse(p) {
+			continue
+		}
+		addr := fmt.Sprintf("127.0.0.1:%d", p)
+		ln, err := net.Listen("tcp", addr)
+		if err == nil {
+			if p != preferred {
+				slog.Info("preferred port busy, using alternative", "wanted", preferred, "using", p)
+			}
+			return ln, nil
+		}
+	}
+
+	// All candidates busy — let the OS pick.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, fmt.Errorf("cannot find available port: %w", err)
+	}
+	slog.Info("using OS-assigned port", "addr", ln.Addr().String())
+	return ln, nil
+}
+
+// portInUse returns true if something is already accepting connections on the port.
+func portInUse(port int) bool {
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 200*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
 }
 
 // openBrowser opens the default browser to the given URL.

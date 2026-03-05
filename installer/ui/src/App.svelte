@@ -2,36 +2,35 @@
   import StepIndicator from './lib/components/StepIndicator.svelte';
   import Welcome from './lib/steps/Welcome.svelte';
   import Servers from './lib/steps/Servers.svelte';
-  import KeyGeneration from './lib/steps/KeyGeneration.svelte';
   import LLMSetup from './lib/steps/LLMSetup.svelte';
   import TelegramBot from './lib/steps/TelegramBot.svelte';
-  import TelegramAuth from './lib/steps/TelegramAuth.svelte';
   import Review from './lib/steps/Review.svelte';
-  import Deployment from './lib/steps/Deployment.svelte';
+  import Install from './lib/steps/Install.svelte';
   import Done from './lib/steps/Done.svelte';
-  import { currentStep } from './lib/stores.js';
+  import { onMount } from 'svelte';
+  import { currentStep, restoreState } from './lib/stores.js';
+
+  onMount(() => {
+    restoreState();
+  });
 
   const stepNames = [
     'Welcome',
     'Servers',
-    'Keys',
     'LLM',
     'Telegram',
-    'Auth',
     'Review',
-    'Deploy',
+    'Install',
     'Done',
   ];
 
   const stepComponents = [
     Welcome,
     Servers,
-    KeyGeneration,
     LLMSetup,
     TelegramBot,
-    TelegramAuth,
     Review,
-    Deployment,
+    Install,
     Done,
   ];
 

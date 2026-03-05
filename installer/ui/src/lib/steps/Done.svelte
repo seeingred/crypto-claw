@@ -13,10 +13,7 @@
   let partyAUrl = $derived(
     state.deployment?.partyAUrl || 'http://localhost:8080'
   );
-  let botToken = $derived(state.telegram?.botToken || '');
-  let botUsername = $derived(
-    botToken ? 'your_bot' : ''
-  );
+  let botUsername = $derived(state.telegram?.botUsername || '');
 
   onMount(() => {
     showConfetti = true;
@@ -179,7 +176,7 @@
             </div>
           </div>
 
-          {#if botToken}
+          {#if botUsername}
             <div class="flex items-center justify-between py-2">
               <span class="text-sm text-gray-600 dark:text-gray-400">Telegram Bot</span>
               <a

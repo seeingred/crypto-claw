@@ -1,6 +1,7 @@
 <script>
   import Button from '../components/Button.svelte';
   import Card from '../components/Card.svelte';
+  import Alert from '../components/Alert.svelte';
   import Input from '../components/Input.svelte';
   import { currentStep, wizardState } from '../stores.js';
   import { saveTelegramToken } from '../api.js';
@@ -9,20 +10,38 @@
   wizardState.subscribe((s) => (state = s));
 
   let botToken = $derived(state.telegram?.botToken ?? '');
+  let botUsername = $derived(state.telegram?.botUsername ?? '');
+  let saving = $state(false);
+  let tokenError = $state('');
 
   function updateToken(value) {
+    tokenError = '';
     wizardState.update((s) => ({
       ...s,
-      telegram: { ...s.telegram, botToken: value },
+      telegram: { ...s.telegram, botToken: value, botUsername: '' },
     }));
   }
 
   async function handleNext() {
+    saving = true;
+    tokenError = '';
     try {
-      await saveTelegramToken(botToken);
-    } catch {
-      // Proceed anyway
+      const result = await saveTelegramToken(botToken);
+      if (result.status === 'error') {
+        tokenError = result.error;
+        saving = false;
+        return;
+      }
+      wizardState.update((s) => ({
+        ...s,
+        telegram: { ...s.telegram, botUsername: result.botUsername || '' },
+      }));
+    } catch (err) {
+      tokenError = err.message || 'Failed to validate token';
+      saving = false;
+      return;
     }
+    saving = false;
     currentStep.update((n) => n + 1);
   }
 
@@ -121,6 +140,22 @@
       oninput={(e) => updateToken(e.target.value)}
       helpText="The token looks like: 123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
     />
+
+    {#if tokenError}
+      <div class="mt-3">
+        <Alert variant="error" title="Invalid Token">
+          <p>{tokenError}</p>
+        </Alert>
+      </div>
+    {/if}
+
+    {#if botUsername}
+      <div class="mt-3">
+        <Alert variant="success" title="Bot Verified">
+          <p>Connected to <strong>@{botUsername}</strong></p>
+        </Alert>
+      </div>
+    {/if}
   </Card>
 
   <div class="flex justify-between mt-8">
@@ -130,11 +165,15 @@
       </svg>
       Back
     </Button>
-    <Button disabled={!botToken.trim()} onclick={handleNext}>
-      Next
-      <svg class="w-4 h-4 ml-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-        <path stroke-linecap="round" stroke-linejoin="round" d="M13 7l5 5m0 0l-5 5m5-5H6" />
-      </svg>
+    <Button disabled={!botToken.trim() || saving} onclick={handleNext}>
+      {#if saving}
+        Validating...
+      {:else}
+        Next
+        <svg class="w-4 h-4 ml-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M13 7l5 5m0 0l-5 5m5-5H6" />
+        </svg>
+      {/if}
     </Button>
   </div>
 </div>

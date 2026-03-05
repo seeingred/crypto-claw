@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -597,14 +599,11 @@ func TestHandleServersTestValidation(t *testing.T) {
 	}
 }
 
-func TestHandleCertsGenerate(t *testing.T) {
-	state := &WizardState{
-		ServerA: SSHConfig{Host: "10.0.0.1"},
-		ServerB: SSHConfig{Host: "10.0.0.2"},
-	}
+func TestHandleInstallPrepare(t *testing.T) {
+	state := &WizardState{}
 	mux := newTestMux(state)
 
-	req := httptest.NewRequest("POST", "/api/certs/generate", nil)
+	req := httptest.NewRequest("POST", "/api/install/prepare", nil)
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 
@@ -612,17 +611,47 @@ func TestHandleCertsGenerate(t *testing.T) {
 		t.Fatalf("status = %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
 	}
 
-	if len(state.CACert) == 0 {
-		t.Error("CACert not set")
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+
+	mnemonic, ok := resp["mnemonic"].(string)
+	if !ok || mnemonic == "" {
+		t.Error("response missing mnemonic")
 	}
-	if len(state.CertA) == 0 {
-		t.Error("CertA not set")
+	words := strings.Split(mnemonic, " ")
+	if len(words) != 24 {
+		t.Errorf("mnemonic has %d words, want 24", len(words))
 	}
-	if len(state.CertB) == 0 {
-		t.Error("CertB not set")
+
+	if resp["ecdsaPubKey"] == nil || resp["ecdsaPubKey"] == "" {
+		t.Error("response missing ecdsaPubKey")
 	}
-	if state.Step != "certs" {
-		t.Errorf("Step = %q, want %q", state.Step, "certs")
+	if resp["eddsaPubKey"] == nil || resp["eddsaPubKey"] == "" {
+		t.Error("response missing eddsaPubKey")
+	}
+
+	if state.Mnemonic == "" {
+		t.Error("mnemonic not stored in state")
+	}
+	if state.Step != "prepared" {
+		t.Errorf("Step = %q, want %q", state.Step, "prepared")
+	}
+}
+
+func TestHandleDeployRequiresPrepare(t *testing.T) {
+	state := &WizardState{} // no mnemonic
+	mux := newTestMux(state)
+
+	req := httptest.NewRequest("POST", "/api/deploy", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "install/prepare") {
+		t.Errorf("error should mention install/prepare, got: %s", body)
 	}
 }
 
@@ -674,10 +703,11 @@ func TestHandleLLMSaveValidation(t *testing.T) {
 	}
 }
 
-func TestHandleTelegramSave(t *testing.T) {
+func TestHandleTelegramSaveInvalidToken(t *testing.T) {
 	state := &WizardState{}
 	mux := newTestMux(state)
 
+	// Invalid token should return status "error" without saving.
 	body := `{"botToken":"123456:ABCdefGHI"}`
 	req := httptest.NewRequest("POST", "/api/telegram/save", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -687,11 +717,15 @@ func TestHandleTelegramSave(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d", w.Code)
 	}
-	if state.TelegramBotToken != "123456:ABCdefGHI" {
-		t.Errorf("TelegramBotToken not saved")
+
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["status"] != "error" {
+		t.Errorf("expected status=error for invalid token, got %v", resp["status"])
 	}
-	if state.Step != "telegram" {
-		t.Errorf("Step = %q, want %q", state.Step, "telegram")
+	// Token should NOT be saved for invalid token.
+	if state.TelegramBotToken != "" {
+		t.Errorf("TelegramBotToken should not be saved for invalid token")
 	}
 }
 
@@ -710,64 +744,81 @@ func TestHandleTelegramSaveValidation(t *testing.T) {
 	}
 }
 
-func TestHandleTelegramVerifyNoToken(t *testing.T) {
-	state := &WizardState{} // no bot token
-	mux := newTestMux(state)
 
-	req := httptest.NewRequest("POST", "/api/telegram/verify", nil)
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
+// TestHandleDKGCancelAndRestart verifies that a second DKG request cancels the
+// first one and proceeds instead of returning 409 forever. This is the fix for
+// the bug where refreshing the page during DKG left the handler permanently locked.
+func TestHandleDKGCancelAndRestart(t *testing.T) {
+	// We can't easily test the real DKG handler (takes minutes), so we test
+	// the cancel-and-wait pattern with a simulated slow handler.
+	var (
+		mu         sync.Mutex
+		cancelPrev context.CancelFunc
+		done       chan struct{}
+	)
 
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d", w.Code, http.StatusBadRequest)
-	}
-}
-
-func TestHandleDKGConflict(t *testing.T) {
-	// The DKG handler uses a mutex to prevent concurrent runs.
-	// We test this by making two requests in quick succession.
-	state := &WizardState{}
-
-	var running sync.Mutex
-	// Create a handler that holds the lock for a bit.
-	handler := func(w http.ResponseWriter, r *http.Request) {
-		if !running.TryLock() {
-			writeError(w, http.StatusConflict, "already running")
-			return
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		if cancelPrev != nil && done != nil {
+			cancelPrev()
+			waitCh := done
+			mu.Unlock()
+			<-waitCh
+			mu.Lock()
 		}
-		defer running.Unlock()
-		time.Sleep(200 * time.Millisecond)
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancelPrev = cancel
+		done = make(chan struct{})
+		currentDone := done
+		mu.Unlock()
 
-	_ = state // state used to verify pattern works
+		defer close(currentDone)
+
+		// Simulate slow work that respects cancellation.
+		select {
+		case <-ctx.Done():
+			writeError(w, http.StatusInternalServerError, "cancelled")
+			return
+		case <-time.After(2 * time.Second):
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /test", handler)
 
 	// Start first request in background.
 	var wg sync.WaitGroup
+	w1 := httptest.NewRecorder()
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		req := httptest.NewRequest("POST", "/test", nil)
-		w := httptest.NewRecorder()
-		mux.ServeHTTP(w, req)
+		mux.ServeHTTP(w1, req)
 	}()
 
-	// Give first handler time to acquire the lock.
+	// Give first handler time to start.
 	time.Sleep(50 * time.Millisecond)
 
-	// Second request should get 409.
-	req2 := httptest.NewRequest("POST", "/test", nil)
+	// Second request should cancel the first and proceed (not 409).
 	w2 := httptest.NewRecorder()
-	mux.ServeHTTP(w2, req2)
-
-	if w2.Code != http.StatusConflict {
-		t.Errorf("concurrent request status = %d, want %d", w2.Code, http.StatusConflict)
-	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		req := httptest.NewRequest("POST", "/test", nil)
+		mux.ServeHTTP(w2, req)
+	}()
 
 	wg.Wait()
+
+	// First request should have been cancelled.
+	if w1.Code != http.StatusInternalServerError {
+		t.Errorf("first request status = %d, want %d (cancelled)", w1.Code, http.StatusInternalServerError)
+	}
+	// Second request should succeed.
+	if w2.Code != http.StatusOK {
+		t.Errorf("second request status = %d, want %d", w2.Code, http.StatusOK)
+	}
 }
 
 func TestCORSMiddleware(t *testing.T) {
@@ -845,14 +896,14 @@ func TestDeployLogsSSE(t *testing.T) {
 	mux.ServeHTTP(w, req)
 
 	body := w.Body.String()
-	if !strings.Contains(body, "data: log line 1") {
-		t.Error("SSE missing log line 1")
+	if !strings.Contains(body, `"message":"log line 1"`) {
+		t.Errorf("SSE missing log line 1, body: %s", body)
 	}
-	if !strings.Contains(body, "data: log line 2") {
-		t.Error("SSE missing log line 2")
+	if !strings.Contains(body, `"message":"log line 2"`) {
+		t.Errorf("SSE missing log line 2, body: %s", body)
 	}
-	if !strings.Contains(body, "event: done") {
-		t.Error("SSE missing done event")
+	if !strings.Contains(body, `"type":"complete"`) {
+		t.Errorf("SSE missing complete event, body: %s", body)
 	}
 	if w.Header().Get("Content-Type") != "text/event-stream" {
 		t.Errorf("Content-Type = %q, want text/event-stream", w.Header().Get("Content-Type"))
@@ -911,6 +962,143 @@ func TestRunInstallerDKG(t *testing.T) {
 	// Shares should be different (they hold different secret shares).
 	if bytes.Equal(ecdsaResult.ShareA.Share, ecdsaResult.ShareB.Share) {
 		t.Error("ECDSA shares should differ between parties")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// findAvailableAddr tests
+// ---------------------------------------------------------------------------
+
+func TestFindAvailableListener(t *testing.T) {
+	ln, err := findAvailableListener(0)
+	if err != nil {
+		t.Fatal("findAvailableListener(0):", err)
+	}
+	defer ln.Close()
+
+	addr := ln.Addr().String()
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("invalid addr %q: %v", addr, err)
+	}
+	if host != "127.0.0.1" {
+		t.Errorf("host = %q, want 127.0.0.1", host)
+	}
+	if port == "" {
+		t.Error("port is empty")
+	}
+}
+
+func TestFindAvailableListenerBusyPort(t *testing.T) {
+	// Occupy a port, then ask for it.
+	busy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal("listen:", err)
+	}
+	defer busy.Close()
+
+	_, busyPortStr, _ := net.SplitHostPort(busy.Addr().String())
+	busyPort := 0
+	fmt.Sscanf(busyPortStr, "%d", &busyPort)
+
+	ln, err := findAvailableListener(busyPort)
+	if err != nil {
+		t.Fatal("findAvailableListener:", err)
+	}
+	defer ln.Close()
+
+	_, gotPort, _ := net.SplitHostPort(ln.Addr().String())
+	if gotPort == busyPortStr {
+		t.Errorf("returned the busy port %s", busyPortStr)
+	}
+}
+
+func TestFindAvailableListenerPreferred(t *testing.T) {
+	// When the preferred port is free, it should be used.
+	tmp, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal("listen:", err)
+	}
+	freeAddr := tmp.Addr().String()
+	tmp.Close() // release it
+
+	_, freePortStr, _ := net.SplitHostPort(freeAddr)
+	freePort := 0
+	fmt.Sscanf(freePortStr, "%d", &freePort)
+
+	ln, err := findAvailableListener(freePort)
+	if err != nil {
+		t.Fatal("findAvailableListener:", err)
+	}
+	defer ln.Close()
+
+	_, gotPort, _ := net.SplitHostPort(ln.Addr().String())
+	if gotPort != freePortStr {
+		t.Errorf("got port %s, want preferred %s", gotPort, freePortStr)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// State restoration test (backend step → frontend step index mapping)
+// ---------------------------------------------------------------------------
+
+func TestHandleStateReturnsStep(t *testing.T) {
+	state := &WizardState{Step: "dkg"}
+	mux := newTestMux(state)
+
+	req := httptest.NewRequest("GET", "/api/state", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+
+	var resp map[string]any
+	json.NewDecoder(w.Body).Decode(&resp)
+
+	step, ok := resp["step"]
+	if !ok {
+		t.Fatal("response missing 'step' field")
+	}
+	if step != "dkg" {
+		t.Errorf("step = %q, want %q", step, "dkg")
+	}
+}
+
+func TestHandleStatePreservesProgress(t *testing.T) {
+	// Simulate a wizard that has completed through the LLM step.
+	state := &WizardState{
+		Step:        "llm",
+		LLMProvider: "anthropic",
+		LLMModel:    "claude-sonnet-4-20250514",
+		ECDSAPubKey: "abcdef1234",
+		EdDSAPubKey: "5678fedcba",
+	}
+	state.ShareA = &tss.KeyShare{PublicKey: []byte{1}}
+	state.ShareB = &tss.KeyShare{PublicKey: []byte{1}}
+
+	mux := newTestMux(state)
+
+	req := httptest.NewRequest("GET", "/api/state", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	var resp map[string]any
+	json.NewDecoder(w.Body).Decode(&resp)
+
+	// All progress should be reflected.
+	if resp["step"] != "llm" {
+		t.Errorf("step = %v, want llm", resp["step"])
+	}
+	if resp["dkgComplete"] != true {
+		t.Errorf("dkgComplete = %v, want true", resp["dkgComplete"])
+	}
+	if resp["llmConfigured"] != true {
+		t.Errorf("llmConfigured = %v, want true", resp["llmConfigured"])
+	}
+	if resp["ecdsaPubKey"] != "abcdef1234" {
+		t.Errorf("ecdsaPubKey = %v", resp["ecdsaPubKey"])
 	}
 }
 

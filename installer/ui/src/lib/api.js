@@ -30,34 +30,48 @@ export async function testSSHConnection(config) {
   });
 }
 
+function toSSHConfig(s) {
+  return {
+    host: s.host || '',
+    port: parseInt(s.port, 10) || 22,
+    user: s.username || '',
+    password: s.password || '',
+    keyPath: s.sshKeyPath || '',
+  };
+}
+
 export async function saveServers(serverA, serverB, localMode) {
-  return request('/servers', {
+  return request('/servers/save', {
     method: 'POST',
-    body: JSON.stringify({ serverA, serverB, localMode }),
+    body: JSON.stringify({
+      serverA: toSSHConfig(serverA),
+      serverB: toSSHConfig(serverB),
+      localMode,
+    }),
   });
 }
 
-export async function runDKG() {
-  return request('/dkg/run', {
+export async function installPrepare() {
+  return request('/install/prepare', {
     method: 'POST',
   });
 }
 
 export async function saveLLMConfig(config) {
-  return request('/llm', {
+  return request('/llm/save', {
     method: 'POST',
     body: JSON.stringify(config),
   });
 }
 
 export async function saveTelegramToken(token) {
-  return request('/telegram/token', {
+  return request('/telegram/save', {
     method: 'POST',
-    body: JSON.stringify({ token }),
+    body: JSON.stringify({ botToken: token }),
   });
 }
 
-export async function verifyTelegramUser() {
+export async function verifyTelegram() {
   return request('/telegram/verify', {
     method: 'POST',
   });
@@ -71,18 +85,28 @@ export async function startDeployment() {
 
 export function subscribeDeployLogs(callback) {
   const evtSource = new EventSource(`${API_BASE}/deploy/logs`);
+  let connected = false;
+
+  evtSource.onopen = () => {
+    connected = true;
+  };
 
   evtSource.onmessage = (event) => {
+    connected = true;
     try {
       const data = JSON.parse(event.data);
       callback(data);
     } catch {
-      callback({ message: event.data });
+      callback({ type: 'log', message: event.data });
     }
   };
 
   evtSource.onerror = () => {
-    callback({ type: 'error', message: 'Connection to log stream lost.' });
+    // EventSource fires onerror on close after server sends its final event.
+    // Only report an error if we never successfully connected.
+    if (!connected) {
+      callback({ type: 'error', message: 'Connection to log stream failed.' });
+    }
     evtSource.close();
   };
 

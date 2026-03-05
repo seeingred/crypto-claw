@@ -3,6 +3,7 @@ package tests
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -168,8 +169,13 @@ func TestWalletDerivation(t *testing.T) {
 	t.Logf("Master EVM address: %s (different from derived)", masterAddr)
 }
 
-// TestWalletRestoration verifies that key derivation is deterministic:
-// deriving with the same path twice produces identical results.
+// TestWalletRestoration verifies wallet recovery from backed-up key shares.
+// This tests the full flow that the installer provides:
+//  1. DKG produces key shares for both parties
+//  2. Shares are serialized to JSON (the backup the user saves)
+//  3. Derive EVM and Solana addresses from the original shares
+//  4. Create a fresh cluster, deserialize the backed-up shares
+//  5. Derive using the same paths — addresses must match
 func TestWalletRestoration(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -179,46 +185,108 @@ func TestWalletRestoration(t *testing.T) {
 	preParams := testutil.GenerateTestPreParams(t)
 	protocol := testutil.NewTestProtocolWithPreParams(preParams)
 
-	// Create context after pre-params generation (which can take minutes).
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	// Run ECDSA DKG.
+	// --- Step 1: DKG for both curves ---
 	testutil.RunDKG(ctx, t, cluster, protocol, tss.CurveSecp256k1)
 
-	derivationPath := "m/44'/60'/0'/0/0"
+	// EdDSA DKG (no pre-params needed).
+	edProtocol := tss.NewProtocol(0)
+	testutil.RunDKG(ctx, t, cluster, edProtocol, tss.CurveEd25519)
 
-	// First derivation.
-	pubKeyA1, pubKeyB1 := testutil.RunDerive(ctx, t, cluster, protocol, tss.CurveSecp256k1, derivationPath)
-
-	// Second derivation with the SAME path — should produce identical keys.
-	// Re-derive from the original master shares (RunDerive uses GetKeyShare which
-	// returns the master share, not the previously derived share).
-	pubKeyA2, pubKeyB2 := testutil.RunDerive(ctx, t, cluster, protocol, tss.CurveSecp256k1, derivationPath)
-
-	if !bytes.Equal(pubKeyA1, pubKeyA2) {
-		t.Fatal("party A: derived public keys differ across two derivations with the same path")
-	}
-	if !bytes.Equal(pubKeyB1, pubKeyB2) {
-		t.Fatal("party B: derived public keys differ across two derivations with the same path")
-	}
-
-	t.Logf("Derivation is deterministic: both runs produced %x", pubKeyA1)
-
-	// Verify EVM addresses also match.
-	adapter := evm.New()
-	addr1, err := adapter.DeriveAddress(pubKeyA1)
+	// --- Step 2: Derive original addresses ---
+	evmPath := "m/44'/60'/0'/0/0"
+	origEVMPubA, _ := testutil.RunDerive(ctx, t, cluster, protocol, tss.CurveSecp256k1, evmPath)
+	evmAdapter := evm.New()
+	origEVMAddr, err := evmAdapter.DeriveAddress(origEVMPubA)
 	if err != nil {
-		t.Fatal("derive EVM address (first):", err)
+		t.Fatal("derive original EVM address:", err)
 	}
-	addr2, err := adapter.DeriveAddress(pubKeyA2)
+	t.Logf("Original EVM address: %s", origEVMAddr)
+
+	origEdPubA, _ := testutil.RunDerive(ctx, t, cluster, edProtocol, tss.CurveEd25519, "m/44'/501'/0'/0'")
+	solAdapter := solana.New()
+	origSolAddr, err := solAdapter.DeriveAddress(origEdPubA)
 	if err != nil {
-		t.Fatal("derive EVM address (second):", err)
+		t.Fatal("derive original Solana address:", err)
 	}
-	if addr1 != addr2 {
-		t.Fatalf("EVM addresses differ across derivations: %s vs %s", addr1, addr2)
+	t.Logf("Original Solana address: %s", origSolAddr)
+
+	// --- Step 3: Serialize shares to JSON (simulating installer backup) ---
+	ecdsaShareA, _ := cluster.PartyA.GetKeyShare(tss.CurveSecp256k1)
+	ecdsaShareB, _ := cluster.PartyB.GetKeyShare(tss.CurveSecp256k1)
+	eddsaShareA, _ := cluster.PartyA.GetKeyShare(tss.CurveEd25519)
+	eddsaShareB, _ := cluster.PartyB.GetKeyShare(tss.CurveEd25519)
+
+	type backupBundle struct {
+		ECDSAShare *tss.KeyShare `json:"ecdsaShare"`
+		EdDSAShare *tss.KeyShare `json:"eddsaShare"`
 	}
-	t.Logf("Restored EVM address: %s", addr1)
+
+	backupA, err := json.Marshal(backupBundle{ECDSAShare: ecdsaShareA, EdDSAShare: eddsaShareA})
+	if err != nil {
+		t.Fatal("marshal backup A:", err)
+	}
+	backupB, err := json.Marshal(backupBundle{ECDSAShare: ecdsaShareB, EdDSAShare: eddsaShareB})
+	if err != nil {
+		t.Fatal("marshal backup B:", err)
+	}
+	t.Logf("Backup A: %d bytes, Backup B: %d bytes", len(backupA), len(backupB))
+
+	// --- Step 4: Restore — deserialize into a fresh cluster ---
+	var restoredA, restoredB backupBundle
+	if err := json.Unmarshal(backupA, &restoredA); err != nil {
+		t.Fatal("unmarshal backup A:", err)
+	}
+	if err := json.Unmarshal(backupB, &restoredB); err != nil {
+		t.Fatal("unmarshal backup B:", err)
+	}
+
+	restoredCluster := testutil.NewTestCluster(t)
+	restoredCluster.PartyA.SetKeyShare(restoredA.ECDSAShare)
+	restoredCluster.PartyB.SetKeyShare(restoredB.ECDSAShare)
+	restoredCluster.PartyA.SetKeyShare(restoredA.EdDSAShare)
+	restoredCluster.PartyB.SetKeyShare(restoredB.EdDSAShare)
+
+	// Verify restored public keys match originals.
+	rEcdsaA, _ := restoredCluster.PartyA.GetKeyShare(tss.CurveSecp256k1)
+	if !bytes.Equal(rEcdsaA.PublicKey, ecdsaShareA.PublicKey) {
+		t.Fatal("restored ECDSA public key doesn't match original")
+	}
+	rEddsaA, _ := restoredCluster.PartyA.GetKeyShare(tss.CurveEd25519)
+	if !bytes.Equal(rEddsaA.PublicKey, eddsaShareA.PublicKey) {
+		t.Fatal("restored EdDSA public key doesn't match original")
+	}
+
+	// --- Step 5: Derive from restored shares — addresses must match ---
+	restoredEVMPubA, restoredEVMPubB := testutil.RunDerive(ctx, t, restoredCluster, protocol, tss.CurveSecp256k1, evmPath)
+	if !bytes.Equal(restoredEVMPubA, restoredEVMPubB) {
+		t.Fatal("restored: EVM derived public keys differ between parties")
+	}
+
+	restoredEVMAddr, err := evmAdapter.DeriveAddress(restoredEVMPubA)
+	if err != nil {
+		t.Fatal("derive restored EVM address:", err)
+	}
+	if restoredEVMAddr != origEVMAddr {
+		t.Fatalf("EVM address mismatch after restore: original=%s restored=%s", origEVMAddr, restoredEVMAddr)
+	}
+	t.Logf("Restored EVM address matches: %s", restoredEVMAddr)
+
+	restoredEdPubA, restoredEdPubB := testutil.RunDerive(ctx, t, restoredCluster, edProtocol, tss.CurveEd25519, "m/44'/501'/0'/0'")
+	if !bytes.Equal(restoredEdPubA, restoredEdPubB) {
+		t.Fatal("restored: Solana derived public keys differ between parties")
+	}
+
+	restoredSolAddr, err := solAdapter.DeriveAddress(restoredEdPubA)
+	if err != nil {
+		t.Fatal("derive restored Solana address:", err)
+	}
+	if restoredSolAddr != origSolAddr {
+		t.Fatalf("Solana address mismatch after restore: original=%s restored=%s", origSolAddr, restoredSolAddr)
+	}
+	t.Logf("Restored Solana address matches: %s", restoredSolAddr)
 }
 
 // TestDeriveAddress_EVM verifies EVM address derivation from a known public key.

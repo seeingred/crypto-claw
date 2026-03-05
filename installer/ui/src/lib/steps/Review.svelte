@@ -6,25 +6,6 @@
   let state = $state({});
   wizardState.subscribe((s) => (state = s));
 
-  let copied = $state('');
-
-  async function copyToClipboard(text, label) {
-    try {
-      await navigator.clipboard.writeText(text);
-      copied = label;
-      setTimeout(() => (copied = ''), 2000);
-    } catch {
-      copied = label;
-      setTimeout(() => (copied = ''), 2000);
-    }
-  }
-
-  function truncate(str, len = 24) {
-    if (!str) return '';
-    if (str.length <= len) return str;
-    return str.slice(0, len) + '...';
-  }
-
   let providerLabel = $derived(
     state.llm?.provider === 'anthropic'
       ? 'Anthropic'
@@ -33,7 +14,7 @@
         : 'Local Model'
   );
 
-  function handleDeploy() {
+  function handleInstall() {
     currentStep.update((n) => n + 1);
   }
 
@@ -48,7 +29,7 @@
       Review Configuration
     </h2>
     <p class="text-gray-600 dark:text-gray-400">
-      Review your settings before deploying.
+      Review your settings before installing. Nothing has been installed yet.
     </p>
   </div>
 
@@ -112,63 +93,6 @@
       {/if}
     </Card>
 
-    <!-- Keys -->
-    <Card title="Generated Keys">
-      <div class="space-y-3">
-        <div class="flex items-center justify-between">
-          <div class="min-w-0 flex-1">
-            <p class="text-xs font-medium text-gray-500 dark:text-gray-400 mb-0.5">
-              ECDSA (EVM)
-            </p>
-            <p class="text-sm font-mono text-gray-900 dark:text-white truncate">
-              {truncate(state.dkg?.ecdsaPublicKey, 40)}
-            </p>
-          </div>
-          <button
-            class="ml-2 p-1.5 rounded-md hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors flex-shrink-0"
-            onclick={() =>
-              copyToClipboard(state.dkg?.ecdsaPublicKey || '', 'ecdsa')}
-          >
-            {#if copied === 'ecdsa'}
-              <svg class="w-4 h-4 text-emerald-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7" />
-              </svg>
-            {:else}
-              <svg class="w-4 h-4 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
-              </svg>
-            {/if}
-          </button>
-        </div>
-
-        <div class="flex items-center justify-between">
-          <div class="min-w-0 flex-1">
-            <p class="text-xs font-medium text-gray-500 dark:text-gray-400 mb-0.5">
-              EdDSA (Solana)
-            </p>
-            <p class="text-sm font-mono text-gray-900 dark:text-white truncate">
-              {truncate(state.dkg?.eddsaPublicKey, 40)}
-            </p>
-          </div>
-          <button
-            class="ml-2 p-1.5 rounded-md hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors flex-shrink-0"
-            onclick={() =>
-              copyToClipboard(state.dkg?.eddsaPublicKey || '', 'eddsa')}
-          >
-            {#if copied === 'eddsa'}
-              <svg class="w-4 h-4 text-emerald-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7" />
-              </svg>
-            {:else}
-              <svg class="w-4 h-4 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
-              </svg>
-            {/if}
-          </button>
-        </div>
-      </div>
-    </Card>
-
     <!-- LLM -->
     <Card title="Transaction Analyzer">
       <div class="flex items-center gap-3">
@@ -221,21 +145,34 @@
           </svg>
         </div>
         <div>
-          <div class="flex items-center gap-2">
-            <p class="text-sm font-medium text-gray-900 dark:text-white">
-              Bot configured
-            </p>
-            {#if state.telegram?.authorized}
-              <span
-                class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400"
-              >
-                Authorized
-              </span>
-            {/if}
-          </div>
-          <p class="text-xs text-gray-500 dark:text-gray-400">
-            User ID: {state.telegram?.userId || 'Not verified'}
+          <p class="text-sm font-medium text-gray-900 dark:text-white">
+            Bot token configured
           </p>
+          <p class="text-xs text-gray-500 dark:text-gray-400">
+            Notifications will be sent via Telegram
+          </p>
+        </div>
+      </div>
+    </Card>
+
+    <!-- What happens next -->
+    <Card title="What Happens Next">
+      <div class="space-y-2 text-sm text-gray-600 dark:text-gray-400">
+        <div class="flex items-start gap-2">
+          <span class="text-indigo-500 font-bold mt-0.5">1.</span>
+          <span>A 24-word recovery phrase will be generated for your wallet</span>
+        </div>
+        <div class="flex items-start gap-2">
+          <span class="text-indigo-500 font-bold mt-0.5">2.</span>
+          <span>Private keys are derived and split into threshold shares</span>
+        </div>
+        <div class="flex items-start gap-2">
+          <span class="text-indigo-500 font-bold mt-0.5">3.</span>
+          <span>TLS certificates are generated for secure communication</span>
+        </div>
+        <div class="flex items-start gap-2">
+          <span class="text-indigo-500 font-bold mt-0.5">4.</span>
+          <span>Services are deployed to your servers</span>
         </div>
       </div>
     </Card>
@@ -248,11 +185,11 @@
       </svg>
       Back
     </Button>
-    <Button variant="success" size="lg" onclick={handleDeploy}>
+    <Button variant="success" size="lg" onclick={handleInstall}>
       <svg class="w-5 h-5 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
         <path stroke-linecap="round" stroke-linejoin="round" d="M15.59 14.37a6 6 0 01-5.84 7.38v-4.8m5.84-2.58a14.98 14.98 0 006.16-12.12A14.98 14.98 0 009.631 8.41m5.96 5.96a14.926 14.926 0 01-5.841 2.58m-.119-8.54a6 6 0 00-7.381 5.84h4.8m2.581-5.84a14.927 14.927 0 00-2.58 5.84m2.699 2.7c-.103.021-.207.041-.311.06a15.09 15.09 0 01-2.448-2.448 14.9 14.9 0 01.06-.312m-2.24 2.39a4.493 4.493 0 00-1.757 4.306 4.493 4.493 0 004.306-1.758M16.5 9a1.5 1.5 0 11-3 0 1.5 1.5 0 013 0z" />
       </svg>
-      Deploy
+      Install
     </Button>
   </div>
 </div>

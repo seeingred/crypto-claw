@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -10,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bnb-chain/tss-lib/v2/ecdsa/keygen"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"golang.org/x/crypto/ssh"
 
@@ -20,11 +22,10 @@ import (
 func registerAPIRoutes(mux *http.ServeMux, state *WizardState) {
 	mux.HandleFunc("POST /api/servers/test", handleServersTest(state))
 	mux.HandleFunc("POST /api/servers/save", handleServersSave(state))
-	mux.HandleFunc("POST /api/certs/generate", handleCertsGenerate(state))
-	mux.HandleFunc("POST /api/dkg/run", handleDKGRun(state))
 	mux.HandleFunc("POST /api/llm/save", handleLLMSave(state))
 	mux.HandleFunc("POST /api/telegram/save", handleTelegramSave(state))
 	mux.HandleFunc("POST /api/telegram/verify", handleTelegramVerify(state))
+	mux.HandleFunc("POST /api/install/prepare", handleInstallPrepare(state))
 	mux.HandleFunc("POST /api/deploy", handleDeploy(state))
 	mux.HandleFunc("GET /api/deploy/logs", handleDeployLogs(state))
 	mux.HandleFunc("GET /api/state", handleState(state))
@@ -92,8 +93,9 @@ func handleServersTest(state *WizardState) http.HandlerFunc {
 func handleServersSave(state *WizardState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			ServerA SSHConfig `json:"serverA"`
-			ServerB SSHConfig `json:"serverB"`
+			ServerA   SSHConfig `json:"serverA"`
+			ServerB   SSHConfig `json:"serverB"`
+			LocalMode bool      `json:"localMode"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
@@ -101,84 +103,57 @@ func handleServersSave(state *WizardState) http.HandlerFunc {
 		}
 
 		state.mu.Lock()
-		state.ServerA = req.ServerA
-		state.ServerB = req.ServerB
+		state.LocalMode = req.LocalMode
+		if req.LocalMode {
+			state.ServerA = SSHConfig{Host: "127.0.0.1", Port: 22, User: "local"}
+			state.ServerB = SSHConfig{Host: "127.0.0.1", Port: 22, User: "local"}
+			state.PartyAAddr = "127.0.0.1:8080"
+		} else {
+			state.ServerA = req.ServerA
+			state.ServerB = req.ServerB
+		}
 		state.Step = "servers"
 		state.mu.Unlock()
 
-		slog.Info("server configs saved",
-			"serverA", req.ServerA.Host,
-			"serverB", req.ServerB.Host,
-		)
+		if req.LocalMode {
+			slog.Info("localhost mode enabled")
+		} else {
+			slog.Info("server configs saved",
+				"serverA", req.ServerA.Host,
+				"serverB", req.ServerB.Host,
+			)
+		}
 
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	}
 }
 
-// handleCertsGenerate generates TLS CA + party certificates.
-func handleCertsGenerate(state *WizardState) http.HandlerFunc {
+// handleInstallPrepare generates a BIP-39 mnemonic and derives keys.
+// This is fast (<1s) and returns the mnemonic for the user to back up
+// before proceeding with deployment.
+func handleInstallPrepare(state *WizardState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		state.mu.Lock()
-		hostsA := []string{state.ServerA.Host}
-		hostsB := []string{state.ServerB.Host}
-		state.mu.Unlock()
-
-		bundle, err := GenerateCerts(hostsA, hostsB)
+		keys, err := GenerateMnemonicKeys()
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, "generate certs: "+err.Error())
+			writeError(w, http.StatusInternalServerError, "generate keys: "+err.Error())
 			return
 		}
 
 		state.mu.Lock()
-		state.CACert = bundle.CACert
-		state.CAKey = bundle.CAKey
-		state.CertA = bundle.CertA
-		state.KeyA = bundle.KeyA
-		state.CertB = bundle.CertB
-		state.KeyB = bundle.KeyB
-		state.Step = "certs"
+		state.Mnemonic = keys.Mnemonic
+		state.ECDSAPubKey = hex.EncodeToString(keys.ECDSAPubKey)
+		state.EdDSAPubKey = hex.EncodeToString(keys.EdDSAPubKey)
+		state.Step = "prepared"
 		state.mu.Unlock()
 
-		slog.Info("TLS certificates generated")
-
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	}
-}
-
-// handleDKGRun runs the DKG ceremony for both ECDSA and EdDSA.
-func handleDKGRun(state *WizardState) http.HandlerFunc {
-	var running sync.Mutex
-
-	return func(w http.ResponseWriter, r *http.Request) {
-		if !running.TryLock() {
-			writeError(w, http.StatusConflict, "DKG is already running")
-			return
-		}
-		defer running.Unlock()
-
-		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Minute)
-		defer cancel()
-
-		ecdsaResult, eddsaResult, err := RunInstallerDKG(ctx)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "DKG failed: "+err.Error())
-			return
-		}
-
-		state.SetECDSAKeys(ecdsaResult.ShareA, ecdsaResult.ShareB)
-		state.SetEdDSAKeys(eddsaResult.ShareA, eddsaResult.ShareB)
-
-		state.mu.Lock()
-		state.Step = "dkg"
-		state.mu.Unlock()
-
-		slog.Info("DKG ceremony complete",
+		slog.Info("mnemonic generated, keys derived",
 			"ecdsaPub", state.ECDSAPubKey[:16]+"...",
 			"eddsaPub", state.EdDSAPubKey[:16]+"...",
 		)
 
 		writeJSON(w, http.StatusOK, map[string]any{
 			"status":      "ok",
+			"mnemonic":    keys.Mnemonic,
 			"ecdsaPubKey": state.ECDSAPubKey,
 			"eddsaPubKey": state.EdDSAPubKey,
 		})
@@ -218,7 +193,7 @@ func handleLLMSave(state *WizardState) http.HandlerFunc {
 	}
 }
 
-// handleTelegramSave saves the Telegram bot token.
+// handleTelegramSave validates the Telegram bot token via getMe and saves it.
 func handleTelegramSave(state *WizardState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
@@ -234,19 +209,32 @@ func handleTelegramSave(state *WizardState) http.HandlerFunc {
 			return
 		}
 
+		// Validate token by calling getMe.
+		bot, err := tgbotapi.NewBotAPI(req.BotToken)
+		if err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"status": "error",
+				"error":  "Invalid bot token: " + err.Error(),
+			})
+			return
+		}
+
 		state.mu.Lock()
 		state.TelegramBotToken = req.BotToken
+		state.TelegramBotUsername = bot.Self.UserName
 		state.Step = "telegram"
 		state.mu.Unlock()
 
-		slog.Info("Telegram bot token saved")
+		slog.Info("Telegram bot token validated", "bot", bot.Self.UserName)
 
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":      "ok",
+			"botUsername": bot.Self.UserName,
+		})
 	}
 }
 
-// handleTelegramVerify polls for the first message to the Telegram bot
-// and returns the user ID of the sender.
+// handleTelegramVerify waits for the user to send /start to the bot and captures their user ID.
 func handleTelegramVerify(state *WizardState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		state.mu.Lock()
@@ -254,33 +242,34 @@ func handleTelegramVerify(state *WizardState) http.HandlerFunc {
 		state.mu.Unlock()
 
 		if token == "" {
-			writeError(w, http.StatusBadRequest, "bot token not set; save it first")
+			writeError(w, http.StatusBadRequest, "save bot token first")
 			return
 		}
 
 		bot, err := tgbotapi.NewBotAPI(token)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid bot token: "+err.Error())
+			writeError(w, http.StatusInternalServerError, "bot init: "+err.Error())
 			return
 		}
 
-		slog.Info("telegram bot connected, waiting for first message...", "botName", bot.Self.UserName)
+		// Clear any old updates.
+		u := tgbotapi.NewUpdate(-1)
+		u.Timeout = 1
+		bot.GetUpdates(u)
 
-		// Poll for the first message with a timeout.
-		u := tgbotapi.NewUpdate(0)
-		u.Timeout = 30
-
+		// Poll for a message (up to 60s).
 		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 		defer cancel()
 
-		// We poll in a loop; the Telegram API long-poll timeout is 30s, so we
-		// may need up to two iterations to cover our 60s timeout.
+		u = tgbotapi.NewUpdate(0)
+		u.Timeout = 5
+
 		for {
 			select {
 			case <-ctx.Done():
 				writeJSON(w, http.StatusOK, map[string]any{
-					"success": false,
-					"error":   "timed out waiting for a message; send /start to the bot",
+					"status": "timeout",
+					"error":  "No message received within 60 seconds. Please send /start to the bot and try again.",
 				})
 				return
 			default:
@@ -288,45 +277,44 @@ func handleTelegramVerify(state *WizardState) http.HandlerFunc {
 
 			updates, err := bot.GetUpdates(u)
 			if err != nil {
-				writeError(w, http.StatusInternalServerError, "get updates: "+err.Error())
-				return
+				continue
 			}
 
 			for _, update := range updates {
 				u.Offset = update.UpdateID + 1
 
-				var userID int64
-				if update.Message != nil && update.Message.From != nil {
-					userID = update.Message.From.ID
-				} else if update.CallbackQuery != nil && update.CallbackQuery.From != nil {
-					userID = update.CallbackQuery.From.ID
+				if update.Message == nil {
+					continue
 				}
 
-				if userID != 0 {
-					state.mu.Lock()
-					state.TelegramUserID = userID
-					state.mu.Unlock()
-
-					// Send confirmation to the user.
-					msg := tgbotapi.NewMessage(userID,
-						"Crypto Claw installer has verified your identity. "+
-							"This bot will be used for transaction notifications.")
-					bot.Send(msg)
-
-					slog.Info("telegram user verified", "userId", userID)
-
-					writeJSON(w, http.StatusOK, map[string]any{
-						"success": true,
-						"userId":  userID,
-					})
-					return
+				userID := update.Message.From.ID
+				userName := update.Message.From.UserName
+				if userName == "" {
+					userName = update.Message.From.FirstName
 				}
+
+				state.mu.Lock()
+				state.TelegramUserID = userID
+				state.mu.Unlock()
+
+				// Send confirmation message.
+				msg := tgbotapi.NewMessage(update.Message.Chat.ID,
+					fmt.Sprintf("✅ Connected! Welcome %s. Crypto Claw will send notifications to this chat.", userName))
+				bot.Send(msg)
+
+				slog.Info("Telegram user verified", "userID", userID, "username", userName)
+
+				writeJSON(w, http.StatusOK, map[string]any{
+					"status":   "ok",
+					"userId":   userID,
+					"username": userName,
+				})
+				return
 			}
 		}
 	}
 }
 
-// handleDeploy starts deployment of both parties.
 func handleDeploy(state *WizardState) http.HandlerFunc {
 	var deploying sync.Mutex
 
@@ -337,36 +325,147 @@ func handleDeploy(state *WizardState) http.HandlerFunc {
 		}
 
 		state.mu.Lock()
+		mnemonic := state.Mnemonic
 		state.DeployDone = false
+		state.DeployFailed = false
 		state.DeployLogs = nil
 		state.Step = "deploying"
 		localMode := state.LocalMode
 		state.mu.Unlock()
+
+		if mnemonic == "" {
+			deploying.Unlock()
+			writeError(w, http.StatusBadRequest, "call /api/install/prepare first")
+			return
+		}
 
 		logFn := func(msg string) {
 			slog.Info(msg)
 			state.AppendLog(msg)
 		}
 
-		// Run deployment in background.
+		// Run the full installation pipeline in background.
 		go func() {
 			defer deploying.Unlock()
+			failed := false
 
+			fail := func(msg string) {
+				logFn(msg)
+				failed = true
+			}
+
+			// Phase 1: Derive keys from mnemonic.
+			logFn("Deriving keys from mnemonic...")
+			keys, err := DeriveKeysFromMnemonic(mnemonic)
+			if err != nil {
+				fail(fmt.Sprintf("ERROR: derive keys: %v", err))
+				state.mu.Lock()
+				state.DeployDone = true
+				state.DeployFailed = true
+				state.mu.Unlock()
+				return
+			}
+
+			partyA := tss.PartyID{ID: "party-a", Index: 0}
+			partyB := tss.PartyID{ID: "party-b", Index: 1}
+			parties := []tss.PartyID{partyA, partyB}
+
+			// Phase 2: Wait for pre-computed ECDSA safe primes (generated in background since startup).
+			ppA, ppB, ppErr := state.WaitPreParams(logFn)
+			if ppErr != nil {
+				fail(fmt.Sprintf("ERROR: generate pre-params: %v", ppErr))
+				state.mu.Lock()
+				state.DeployDone = true
+				state.DeployFailed = true
+				state.mu.Unlock()
+				return
+			}
+			logFn("Cryptographic parameters ready.")
+
+			// Phase 3: Trusted dealer key splitting.
+			logFn("Splitting ECDSA key into threshold shares...")
+			ecdsaShares, err := tss.DealerSetupECDSA(
+				keys.ECDSAPrivKey, keys.ECDSAPubKey, keys.ECDSAChainCode,
+				parties, []*keygen.LocalPreParams{ppA, ppB},
+			)
+			if err != nil {
+				fail(fmt.Sprintf("ERROR: ECDSA dealer setup: %v", err))
+				state.mu.Lock()
+				state.DeployDone = true
+				state.DeployFailed = true
+				state.mu.Unlock()
+				return
+			}
+
+			logFn("Splitting EdDSA key into threshold shares...")
+			eddsaShares, err := tss.DealerSetupEdDSA(
+				keys.EdDSAPrivKey, keys.EdDSAPubKey, keys.EdDSAChainCode,
+				parties,
+			)
+			if err != nil {
+				fail(fmt.Sprintf("ERROR: EdDSA dealer setup: %v", err))
+				state.mu.Lock()
+				state.DeployDone = true
+				state.DeployFailed = true
+				state.mu.Unlock()
+				return
+			}
+
+			state.SetECDSAKeys(ecdsaShares[0], ecdsaShares[1])
+			state.SetEdDSAKeys(eddsaShares[0], eddsaShares[1])
+			logFn("Key shares generated.")
+
+			// Phase 4: Generate TLS certificates.
+			logFn("Generating TLS certificates...")
+			state.mu.Lock()
+			hostsA := []string{state.ServerA.Host}
+			hostsB := []string{state.ServerB.Host}
+			state.mu.Unlock()
+
+			bundle, err := GenerateCerts(hostsA, hostsB)
+			if err != nil {
+				fail(fmt.Sprintf("ERROR: generate certs: %v", err))
+				state.mu.Lock()
+				state.DeployDone = true
+				state.DeployFailed = true
+				state.mu.Unlock()
+				return
+			}
+
+			state.mu.Lock()
+			state.CACert = bundle.CACert
+			state.CAKey = bundle.CAKey
+			state.CertA = bundle.CertA
+			state.KeyA = bundle.KeyA
+			state.CertB = bundle.CertB
+			state.KeyB = bundle.KeyB
+			state.mu.Unlock()
+			logFn("TLS certificates generated.")
+
+			// Phase 5: Deploy to servers.
 			if localMode {
 				logFn("Starting local deployment...")
 				if err := DeployLocal(state, logFn); err != nil {
-					logFn(fmt.Sprintf("ERROR: local deploy failed: %v", err))
+					fail(fmt.Sprintf("ERROR: local deploy failed: %v", err))
 				}
 			} else {
 				logFn("Starting remote deployment...")
-				deployRemote(state, logFn)
+				if err := deployRemote(state, logFn); err != nil {
+					fail(fmt.Sprintf("ERROR: %v", err))
+				}
 			}
 
 			state.mu.Lock()
 			state.DeployDone = true
-			state.Step = "done"
+			state.DeployFailed = failed
+			if !failed {
+				state.Step = "done"
+				logFn("Deployment finished successfully.")
+			} else {
+				state.Step = "deploying" // stay on install step
+				logFn("Deployment finished with errors.")
+			}
 			state.mu.Unlock()
-			logFn("Deployment finished.")
 		}()
 
 		writeJSON(w, http.StatusOK, map[string]string{"status": "started"})
@@ -374,7 +473,7 @@ func handleDeploy(state *WizardState) http.HandlerFunc {
 }
 
 // deployRemote deploys both parties to their respective remote servers.
-func deployRemote(state *WizardState, logFn func(string)) {
+func deployRemote(state *WizardState, logFn func(string)) error {
 	state.mu.Lock()
 	serverA := state.ServerA
 	serverB := state.ServerB
@@ -393,7 +492,7 @@ func deployRemote(state *WizardState, logFn func(string)) {
 	clientB, err := SSHConnect(serverB)
 	if err != nil {
 		logFn(fmt.Sprintf("ERROR: SSH connect to Party B (%s): %v", serverB.Host, err))
-		return
+		return fmt.Errorf("SSH connect to Party B (%s): %w", serverB.Host, err)
 	}
 	defer clientB.Close()
 
@@ -401,7 +500,7 @@ func deployRemote(state *WizardState, logFn func(string)) {
 	cfgB := buildPartyConfig(state, "b", certDirB)
 	if err := DeployParty(clientB, "b", cfgB, certB, keyB, caCert, logFn); err != nil {
 		logFn(fmt.Sprintf("ERROR: deploy Party B: %v", err))
-		return
+		return fmt.Errorf("deploy Party B: %w", err)
 	}
 
 	// Deploy Party A.
@@ -409,7 +508,7 @@ func deployRemote(state *WizardState, logFn func(string)) {
 	clientA, err := SSHConnect(serverA)
 	if err != nil {
 		logFn(fmt.Sprintf("ERROR: SSH connect to Party A (%s): %v", serverA.Host, err))
-		return
+		return fmt.Errorf("SSH connect to Party A (%s): %w", serverA.Host, err)
 	}
 	defer clientA.Close()
 
@@ -417,7 +516,7 @@ func deployRemote(state *WizardState, logFn func(string)) {
 	cfgA := buildPartyConfig(state, "a", certDirA)
 	if err := DeployParty(clientA, "a", cfgA, certA, keyA, caCert, logFn); err != nil {
 		logFn(fmt.Sprintf("ERROR: deploy Party A: %v", err))
-		return
+		return fmt.Errorf("deploy Party A: %w", err)
 	}
 
 	// Upload key shares to both servers.
@@ -435,12 +534,15 @@ func deployRemote(state *WizardState, logFn func(string)) {
 
 	if errA != nil {
 		logFn(fmt.Sprintf("ERROR: upload key shares to Party A: %v", errA))
+		return errA
 	}
 	if errB != nil {
 		logFn(fmt.Sprintf("ERROR: upload key shares to Party B: %v", errB))
+		return errB
 	}
 
 	logFn("Remote deployment complete.")
+	return nil
 }
 
 // uploadKeyShares uploads serialized key shares to a remote server.
@@ -493,6 +595,10 @@ func handleDeployLogs(state *WizardState) http.HandlerFunc {
 		w.Header().Set("Connection", "keep-alive")
 		w.Header().Set("X-Accel-Buffering", "no")
 
+		// Flush headers immediately so the browser's EventSource connects.
+		fmt.Fprintf(w, ": connected\n\n")
+		flusher.Flush()
+
 		ctx := r.Context()
 		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
@@ -504,7 +610,8 @@ func handleDeployLogs(state *WizardState) http.HandlerFunc {
 			case <-ticker.C:
 				logs := state.DrainLogs()
 				for _, log := range logs {
-					fmt.Fprintf(w, "data: %s\n\n", log)
+					evt, _ := json.Marshal(map[string]string{"type": "log", "message": log})
+					fmt.Fprintf(w, "data: %s\n\n", evt)
 				}
 				if len(logs) > 0 {
 					flusher.Flush()
@@ -512,10 +619,17 @@ func handleDeployLogs(state *WizardState) http.HandlerFunc {
 
 				state.mu.Lock()
 				done := state.DeployDone
+				failed := state.DeployFailed
 				state.mu.Unlock()
 
 				if done && len(logs) == 0 {
-					fmt.Fprintf(w, "event: done\ndata: deployment complete\n\n")
+					if failed {
+						evt, _ := json.Marshal(map[string]string{"type": "error", "message": "Deployment failed. Check the logs above for details."})
+						fmt.Fprintf(w, "data: %s\n\n", evt)
+					} else {
+						evt, _ := json.Marshal(map[string]string{"type": "complete", "message": "deployment complete"})
+						fmt.Fprintf(w, "data: %s\n\n", evt)
+					}
 					flusher.Flush()
 					return
 				}

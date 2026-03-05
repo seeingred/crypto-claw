@@ -88,6 +88,9 @@ func RunInstallerDKG(ctx context.Context) (*DKGResult, *DKGResult, error) {
 	}()
 	ppWg.Wait()
 
+	if ctx.Err() != nil {
+		return nil, nil, ctx.Err()
+	}
 	if ppErrA != nil {
 		return nil, nil, fmt.Errorf("generate pre-params for party-a: %w", ppErrA)
 	}
@@ -116,6 +119,10 @@ func RunInstallerDKG(ctx context.Context) (*DKGResult, *DKGResult, error) {
 		return nil, nil, fmt.Errorf("ECDSA DKG: %w", err)
 	}
 	slog.Info("ECDSA DKG complete", "pubKey", fmt.Sprintf("%x", ecdsaResult.ShareA.PublicKey[:8]))
+
+	if ctx.Err() != nil {
+		return nil, nil, ctx.Err()
+	}
 
 	// Run EdDSA DKG (no pre-params needed for EdDSA).
 	slog.Info("running EdDSA (ed25519) DKG ceremony")

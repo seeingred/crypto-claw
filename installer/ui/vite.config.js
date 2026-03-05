@@ -11,4 +11,10 @@ export default defineConfig({
       '/api': 'http://localhost:8100',
     },
   },
+  test: {
+    environment: 'jsdom',
+  },
+  resolve: {
+    conditions: ['browser'],
+  },
 });

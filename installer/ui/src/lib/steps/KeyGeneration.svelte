@@ -7,7 +7,7 @@
 
   let generating = $state(false);
   let error = $state('');
-  let copied = $state('');
+  let copied = $state(false);
 
   let state = $state({});
   wizardState.subscribe((s) => (state = s));
@@ -24,10 +24,10 @@
         dkg: {
           ...s.dkg,
           completed: true,
-          ecdsaPublicKey: result.ecdsaPublicKey || '0x04a1b2c3d4e5f6...(example)',
-          eddsaPublicKey: result.eddsaPublicKey || 'ed25519:AbCdEf...(example)',
-          seedPhraseA: result.seedPhraseA || 'abandon ability able about above absent absorb abstract absurd abuse access accident',
-          seedPhraseB: result.seedPhraseB || 'beach because become bedroom begin behind believe below bench benefit best better',
+          ecdsaPubKey: result.ecdsaPubKey,
+          eddsaPubKey: result.eddsaPubKey,
+          backupA: result.backupA,
+          backupB: result.backupB,
         },
       }));
     } catch (err) {
@@ -37,32 +37,43 @@
     }
   }
 
-  function toggleSeedSaved(checked) {
+  function toggleBackupSaved(checked) {
     wizardState.update((s) => ({
       ...s,
-      dkg: { ...s.dkg, seedSaved: checked },
+      dkg: { ...s.dkg, backupSaved: checked },
     }));
   }
 
-  async function copyToClipboard(text, label) {
+  function buildBackupJSON() {
+    return JSON.stringify(
+      {
+        ecdsaPubKey: dkg.ecdsaPubKey,
+        eddsaPubKey: dkg.eddsaPubKey,
+        partyA: JSON.parse(dkg.backupA || '{}'),
+        partyB: JSON.parse(dkg.backupB || '{}'),
+      },
+      null,
+      2
+    );
+  }
+
+  async function copyAll() {
+    const text = buildBackupJSON();
     try {
       await navigator.clipboard.writeText(text);
-      copied = label;
-      setTimeout(() => (copied = ''), 2000);
     } catch {
-      // Fallback
       const textarea = document.createElement('textarea');
       textarea.value = text;
       document.body.appendChild(textarea);
       textarea.select();
       document.execCommand('copy');
       document.body.removeChild(textarea);
-      copied = label;
-      setTimeout(() => (copied = ''), 2000);
     }
+    copied = true;
+    setTimeout(() => (copied = false), 2000);
   }
 
-  let canProceed = $derived(dkg.completed && dkg.seedSaved);
+  let canProceed = $derived(dkg.completed && dkg.backupSaved);
 
   function handleNext() {
     currentStep.update((n) => n + 1);
@@ -149,99 +160,59 @@
   {:else}
     <div class="space-y-6">
       <!-- Public Keys -->
-      <Card title="Generated Public Keys">
+      <Card title="Master Public Keys">
         <div class="space-y-4">
           <div>
-            <div class="flex items-center justify-between mb-1">
-              <span class="text-sm font-medium text-gray-700 dark:text-gray-300"
-                >ECDSA Public Key (EVM Chains)</span
-              >
-              <button
-                class="text-xs text-indigo-600 dark:text-indigo-400 hover:text-indigo-700 dark:hover:text-indigo-300 transition-colors"
-                onclick={() => copyToClipboard(dkg.ecdsaPublicKey, 'ecdsa')}
-              >
-                {copied === 'ecdsa' ? 'Copied!' : 'Copy'}
-              </button>
-            </div>
-            <div
-              class="font-mono text-xs bg-gray-50 dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg p-3 break-all"
+            <span class="text-sm font-medium text-gray-700 dark:text-gray-300"
+              >ECDSA (EVM / Cosmos)</span
             >
-              {dkg.ecdsaPublicKey}
+            <div
+              class="font-mono text-xs bg-gray-50 dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg p-3 mt-1 break-all"
+            >
+              {dkg.ecdsaPubKey}
             </div>
           </div>
 
           <div>
-            <div class="flex items-center justify-between mb-1">
-              <span class="text-sm font-medium text-gray-700 dark:text-gray-300"
-                >EdDSA Public Key (Solana)</span
-              >
-              <button
-                class="text-xs text-indigo-600 dark:text-indigo-400 hover:text-indigo-700 dark:hover:text-indigo-300 transition-colors"
-                onclick={() => copyToClipboard(dkg.eddsaPublicKey, 'eddsa')}
-              >
-                {copied === 'eddsa' ? 'Copied!' : 'Copy'}
-              </button>
-            </div>
-            <div
-              class="font-mono text-xs bg-gray-50 dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg p-3 break-all"
+            <span class="text-sm font-medium text-gray-700 dark:text-gray-300"
+              >EdDSA (Solana)</span
             >
-              {dkg.eddsaPublicKey}
+            <div
+              class="font-mono text-xs bg-gray-50 dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg p-3 mt-1 break-all"
+            >
+              {dkg.eddsaPubKey}
             </div>
           </div>
         </div>
       </Card>
 
-      <!-- Seed Phrases Warning -->
-      <Alert variant="warning" title="Save Your Seed Phrases!">
+      <!-- Key Share Backup -->
+      <Alert variant="warning" title="Back Up Your Key Shares!">
         <p>
-          Without these seed phrases, you cannot recover your wallets. Store
-          them in a secure, offline location. Never share them with anyone.
+          Each party holds a share of two master private keys (ECDSA + EdDSA).
+          Neither share alone can sign transactions. Copy the full backup
+          below and save it to a secure, offline location. Without it, you
+          cannot restore signing capability if a server is lost.
         </p>
       </Alert>
 
-      <!-- Seed Phrases -->
-      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <Card title="Party A Seed Phrase">
-          <div class="relative">
-            <div class="seed-phrase-box">{dkg.seedPhraseA}</div>
-            <button
-              class="absolute top-2 right-2 p-1.5 rounded-md bg-white dark:bg-gray-700 border border-gray-200 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-600 transition-colors"
-              onclick={() => copyToClipboard(dkg.seedPhraseA, 'seedA')}
-              title="Copy to clipboard"
-            >
-              {#if copied === 'seedA'}
-                <svg class="w-4 h-4 text-emerald-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-                  <path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7" />
-                </svg>
-              {:else}
-                <svg class="w-4 h-4 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-                  <path stroke-linecap="round" stroke-linejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
-                </svg>
-              {/if}
-            </button>
-          </div>
-        </Card>
-
-        <Card title="Party B Seed Phrase">
-          <div class="relative">
-            <div class="seed-phrase-box">{dkg.seedPhraseB}</div>
-            <button
-              class="absolute top-2 right-2 p-1.5 rounded-md bg-white dark:bg-gray-700 border border-gray-200 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-600 transition-colors"
-              onclick={() => copyToClipboard(dkg.seedPhraseB, 'seedB')}
-              title="Copy to clipboard"
-            >
-              {#if copied === 'seedB'}
-                <svg class="w-4 h-4 text-emerald-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-                  <path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7" />
-                </svg>
-              {:else}
-                <svg class="w-4 h-4 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-                  <path stroke-linecap="round" stroke-linejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
-                </svg>
-              {/if}
-            </button>
-          </div>
-        </Card>
+      <div class="text-center">
+        <Button size="lg" onclick={copyAll}>
+          {#if copied}
+            <svg class="w-5 h-5 mr-1 text-emerald-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7" />
+            </svg>
+            Copied!
+          {:else}
+            <svg class="w-5 h-5 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+            </svg>
+            Copy All Key Shares
+          {/if}
+        </Button>
+        <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">
+          Copies public keys and both party key shares as JSON
+        </p>
       </div>
 
       <!-- Confirmation Checkbox -->
@@ -250,12 +221,12 @@
       >
         <input
           type="checkbox"
-          checked={dkg.seedSaved}
-          onchange={(e) => toggleSeedSaved(e.target.checked)}
+          checked={dkg.backupSaved}
+          onchange={(e) => toggleBackupSaved(e.target.checked)}
           class="w-4 h-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
         />
         <span class="text-sm font-medium text-gray-900 dark:text-white">
-          I have saved my seed phrases in a secure location
+          I have saved the key share backup in a secure location
         </span>
       </label>
     </div>
