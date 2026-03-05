@@ -4,19 +4,21 @@ A 2-of-2 Multi-Party Computation Threshold Signature Scheme (MPC-TSS) service th
 
 ## Quick Start
 
-Install on macOS, Linux, or WSL with a single command:
+### From the repo (recommended for development)
+
+```bash
+go run ./cmd/installer
+```
+
+Opens the installer wizard at http://localhost:3000. The Svelte UI is pre-built and embedded in the Go binary — no Node.js needed.
+
+### Remote install (no repo checkout)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/seeingred/crypto-claw/main/scripts/install.sh | bash
 ```
 
-This launches a step-by-step web wizard in your browser that handles TLS certificate generation, key generation (DKG), LLM configuration, Telegram bot setup, and deployment to your servers via SSH.
-
-For localhost testing (no servers needed):
-
-```bash
-SKIP_BROWSER=1 curl -fsSL https://raw.githubusercontent.com/seeingred/crypto-claw/main/scripts/install.sh | bash
-```
+This clones the repo, builds the binary, and launches the wizard. Requires Go 1.21+ and git.
 
 ## Architecture
 
