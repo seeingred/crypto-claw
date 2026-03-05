@@ -2,6 +2,22 @@
 
 A 2-of-2 Multi-Party Computation Threshold Signature Scheme (MPC-TSS) service that splits signing capability across two independent servers. Neither server alone can produce a valid signature, protecting against key theft even if one server is compromised.
 
+## Quick Start
+
+Install on macOS, Linux, or WSL with a single command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/seeingred/crypto-claw/main/scripts/install.sh | bash
+```
+
+This launches a step-by-step web wizard in your browser that handles TLS certificate generation, key generation (DKG), LLM configuration, Telegram bot setup, and deployment to your servers via SSH.
+
+For localhost testing (no servers needed):
+
+```bash
+SKIP_BROWSER=1 curl -fsSL https://raw.githubusercontent.com/seeingred/crypto-claw/main/scripts/install.sh | bash
+```
+
 ## Architecture
 
 ```
@@ -51,13 +67,15 @@ A 2-of-2 Multi-Party Computation Threshold Signature Scheme (MPC-TSS) service th
 cmd/
   party-a/          Party A entry point
   party-b/          Party B entry point
-  installer/        Setup wizard entry point
+  installer/        Setup wizard (Go backend + embedded Svelte UI)
+installer/
+  ui/               Svelte + Tailwind CSS frontend for the wizard
 internal/
   config/           Configuration loading
   partya/           Party A service + REST API
   partyb/           Party B service (analyzer, Telegram bot)
   store/            Encrypted key share storage (PostgreSQL)
-  transport/        Mutual TLS transport layer
+  transport/        Mutual TLS transport + certificate generation
   tss/              TSS protocol (DKG, signing, derivation, resharing)
   vm/               VM adapter interface
     evm/            EVM adapter (go-ethereum)
@@ -65,23 +83,50 @@ internal/
     tendermint/     Tendermint/Cosmos adapter
 contracts/
   evm/              Solidity contracts for integration tests
+scripts/
+  install.sh        One-liner installer script
+  uninstall.sh      Cleanup script (removes containers, images, config)
+  docker-init-db.sql  PostgreSQL initialization
 tests/
-  testutil/         Test infrastructure (cluster, router, Hardhat, Solana helpers)
-  case1_*           Wallet creation and restoration tests
-  case2_*           Native transfer tests (ETH, SOL)
-  case3_*           Token transfer tests (ERC-20, SPL)
-  case4_*           Staking tests (deposit, claim)
+  testutil/         Test infrastructure (cluster, router, Hardhat, Solana)
+  case1_*           Wallet creation and restoration
+  case2_*           Native transfers (ETH, SOL)
+  case3_*           Token transfers (ERC-20, SPL)
+  case4_*           Staking (deposit, claim)
 ```
+
+## Installer Wizard
+
+The installer runs on your local machine (not on either server) and guides you through the full setup:
+
+1. **Welcome** — explains the two-server architecture
+2. **Server configuration** — SSH access to both servers (password or key auth), with optional localhost mode for testing
+3. **Key generation (DKG)** — generates ECDSA (secp256k1) and EdDSA (ed25519) master keys via 2-of-2 DKG ceremony
+4. **LLM setup** — configure OpenAI, Anthropic, or a local model endpoint for the TX analyzer
+5. **Telegram bot** — instructions for BotFather, prompts for bot token
+6. **Telegram authorization** — waits for the first message to verify user identity
+7. **Review** — displays all settings before deployment
+8. **Deployment** — deploys Docker containers to both servers via SSH with live logs
+9. **Done** — shows completion status and link to the Party A web UI
+
+### Uninstalling
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/seeingred/crypto-claw/main/scripts/uninstall.sh | bash
+```
+
+Connects to both servers, stops and removes Docker containers and images, cleans up configuration files. Prompts for confirmation before proceeding.
 
 ## Prerequisites
 
 - Go 1.21+
 - PostgreSQL (for encrypted key share storage)
-- Node.js 18+ (for Hardhat integration tests)
+- Docker (for deployment)
+- Node.js 18+ (for building the installer UI and Hardhat integration tests)
 
 ## Configuration
 
-Both services are configured via a JSON file (`config.json`). See `internal/config/config.go` for the full schema.
+Both services are configured via a JSON file (`config.json`). See `internal/config/config.go` for the full schema. The installer wizard generates these automatically.
 
 ### Party A (config-a.json)
 
@@ -101,7 +146,7 @@ Both services are configured via a JSON file (`config.json`). See `internal/conf
     "listenAddr": "127.0.0.1:8080"
   },
   "transport": {
-    "remoteAddr": "secure-server:9443",
+    "remoteAddr": "secure-server:9000",
     "certFile": "/etc/crypto-claw/cert.pem",
     "keyFile": "/etc/crypto-claw/key.pem",
     "caCertFile": "/etc/crypto-claw/ca.pem"
@@ -132,7 +177,7 @@ Both services are configured via a JSON file (`config.json`). See `internal/conf
     "sslMode": "disable"
   },
   "transport": {
-    "listenAddr": "0.0.0.0:9443",
+    "listenAddr": "0.0.0.0:9000",
     "certFile": "/etc/crypto-claw/cert.pem",
     "keyFile": "/etc/crypto-claw/key.pem",
     "caCertFile": "/etc/crypto-claw/ca.pem"
@@ -155,6 +200,12 @@ Both services are configured via a JSON file (`config.json`). See `internal/conf
 
 ## Running
 
+### With the installer (recommended)
+
+The installer handles everything. See [Quick Start](#quick-start).
+
+### Manually
+
 ```bash
 # Party A
 go run ./cmd/party-a -config config-a.json -passphrase "your-encryption-passphrase"
@@ -162,6 +213,30 @@ go run ./cmd/party-a -config config-a.json -passphrase "your-encryption-passphra
 # Party B
 go run ./cmd/party-b -config config-b.json -passphrase "your-encryption-passphrase"
 ```
+
+### With Docker Compose (local development)
+
+```bash
+docker compose up -d
+```
+
+This starts PostgreSQL, Party A, and Party B. Configure credentials via environment:
+
+```bash
+CCLAW_PASSPHRASE=your-passphrase docker compose up -d
+```
+
+### Building Docker images
+
+```bash
+# Party A
+docker build --target party-a -t crypto-claw-party-a .
+
+# Party B
+docker build --target party-b -t crypto-claw-party-b .
+```
+
+Both images are built from a multi-stage Dockerfile: Go binaries are compiled in a builder stage, then copied into minimal Alpine containers with a non-root user, health checks, and automatic restarts.
 
 ## API Reference
 
@@ -273,6 +348,8 @@ Check service health.
 - **Compromised AI server**: attacker gets Party A's key share (useless alone), can send signing requests but cannot bypass Party B's validation
 - **Protection layers**: deterministic ABI checks, LLM-based analysis, user escalation via Telegram, mutual TLS transport
 - **Key storage**: shares encrypted with AES-256-GCM in PostgreSQL
+- **Transport**: mutual TLS with self-signed CA; both parties pin each other's certificates
+- **Containers**: non-root user, read-only config mounts, no exposed ports beyond the required ones
 
 ## TSS Technical Details
 
@@ -286,6 +363,12 @@ Check service health.
 ```bash
 # Unit tests (fast, no external dependencies)
 go test ./internal/... -short
+
+# Installer tests (state, handlers, certs, config)
+go test ./cmd/installer/ -short -v
+
+# Installer DKG integration test (real ECDSA + EdDSA key generation, ~30s)
+go test ./cmd/installer/ -run TestRunInstallerDKG -timeout 15m -v
 
 # Case 1: Wallet creation and restoration (real DKG, ~30s)
 go test ./tests/ -run TestWallet -timeout 30m -v
