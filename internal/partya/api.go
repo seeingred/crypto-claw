@@ -23,6 +23,7 @@ func NewRouter(svc *Service) http.Handler {
 	r.Get("/keys", api.handleListKeys)
 	r.Put("/keys/{path}/label", api.handleUpdateLabel)
 	r.Get("/health", api.handleHealth)
+	r.Get("/api", api.handleAPIDocs)
 
 	return r
 }
@@ -179,6 +180,174 @@ func (h *apiHandler) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, status, health)
 }
+
+func (h *apiHandler) handleAPIDocs(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+	w.Write([]byte(apiDocsMarkdown))
+}
+
+const apiDocsMarkdown = `# Crypto Claw — Party A API Reference
+
+Base URL: ` + "`http://localhost:8080`" + `
+
+## Endpoints
+
+### GET /health
+
+Check service health and connectivity to Party B.
+
+**Response:**
+` + "```json" + `
+{"status": "ok", "secureServerConnected": true}
+` + "```" + `
+
+---
+
+### POST /derive
+
+Derive a new wallet address from the master key using a BIP-44 derivation path.
+
+**Request:**
+` + "```json" + `
+{
+  "derivationPath": "m/44'/60'/0'/0/0",
+  "label": "My ETH Wallet"
+}
+` + "```" + `
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| derivationPath | string | yes | BIP-44 path. Use coin type 60 for EVM, 501 for Solana |
+| label | string | no | Human-readable label for the derived key |
+
+**Response:**
+` + "```json" + `
+{
+  "address": "0x...",
+  "derivationPath": "m/44'/60'/0'/0/0",
+  "publicKey": "04..."
+}
+` + "```" + `
+
+---
+
+### POST /sign
+
+Request a transaction signature. The transaction is analyzed by Party B's LLM-based
+TX analyzer before signing. If the analyzer flags the transaction, it is escalated
+to the authorized Telegram user for manual approval.
+
+**Request:**
+` + "```json" + `
+{
+  "derivationPath": "m/44'/60'/0'/0/0",
+  "to": ["0xRecipientAddress"],
+  "value": "1000000000000000000",
+  "data": "0x",
+  "chainId": "1",
+  "gasLimit": 21000,
+  "gasPrice": "20000000000",
+  "nonce": 0
+}
+` + "```" + `
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| derivationPath | string | yes | BIP-44 path of the signing key |
+| to | string[] | yes | Recipient address(es) |
+| value | string | no | Value in smallest unit (wei for EVM) |
+| data | string | no | Hex-encoded calldata |
+| chainId | string | no | Chain ID for EVM transactions |
+| gasLimit | number | no | Gas limit |
+| gasPrice | string | no | Gas price in smallest unit |
+| nonce | number | no | Transaction nonce |
+
+**Response (approved):** HTTP 200
+` + "```json" + `
+{
+  "txId": "uuid",
+  "status": "signed",
+  "signature": "0x..."
+}
+` + "```" + `
+
+**Response (pending review):** HTTP 202
+` + "```json" + `
+{
+  "txId": "uuid",
+  "status": "pending_review",
+  "reason": "Large transfer flagged for manual approval"
+}
+` + "```" + `
+
+---
+
+### GET /sign/{txId}
+
+Check the status of a previously submitted signing request.
+
+**Response:**
+` + "```json" + `
+{
+  "txId": "uuid",
+  "status": "signed|pending_review|rejected",
+  "signature": "0x..."
+}
+` + "```" + `
+
+---
+
+### GET /keys
+
+List all derived keys.
+
+**Response:**
+` + "```json" + `
+{
+  "keys": {
+    "m/44'/60'/0'/0/0": {
+      "derivationPath": "m/44'/60'/0'/0/0",
+      "address": "0x...",
+      "publicKey": "04...",
+      "label": "My ETH Wallet"
+    }
+  }
+}
+` + "```" + `
+
+---
+
+### PUT /keys/{path}/label
+
+Update the label of a derived key.
+
+**Request:**
+` + "```json" + `
+{"label": "New Label"}
+` + "```" + `
+
+**Response:**
+` + "```json" + `
+{"ok": true}
+` + "```" + `
+
+---
+
+## Common derivation paths
+
+| Chain | Coin Type | Example Path |
+|-------|-----------|-------------|
+| Ethereum / EVM | 60 | m/44'/60'/0'/0/0 |
+| Solana | 501 | m/44'/501'/0'/0' |
+| Cosmos | 118 | m/44'/118'/0'/0/0 |
+
+## Error format
+
+All errors return:
+` + "```json" + `
+{"error": "description of what went wrong"}
+` + "```" + `
+`
 
 // Helper functions
 

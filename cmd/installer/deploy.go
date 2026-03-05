@@ -252,6 +252,24 @@ func DeployLocal(state *WizardState, logFn func(string)) error {
 		logFn(fmt.Sprintf("[%s] Configuration written to %s", party, partyDir))
 	}
 
+	// Skip starting processes if CRYPTO_CLAW_NO_PROCESSES is set (e.g. in tests).
+	if os.Getenv("CRYPTO_CLAW_NO_PROCESSES") != "" {
+		logFn("[local] Skipping process start (CRYPTO_CLAW_NO_PROCESSES set).")
+		logFn("[local] Local deployment complete (config only).")
+		logFn(fmt.Sprintf("[local] Config directory: %s", baseDir))
+		return nil
+	}
+
+	// Kill any existing party processes from a previous install.
+	logFn("[local] Stopping any existing party processes...")
+	killExistingParties(logFn)
+
+	// Ensure PostgreSQL databases exist for local mode.
+	logFn("[local] Setting up PostgreSQL databases...")
+	if err := ensureLocalPostgres(logFn); err != nil {
+		return fmt.Errorf("postgres setup: %w", err)
+	}
+
 	// In local mode, start processes directly.
 	logFn("[local] Starting Party B...")
 	partyBDir := filepath.Join(baseDir, "party-b")
@@ -279,8 +297,115 @@ func DeployLocal(state *WizardState, logFn func(string)) error {
 		logFn(fmt.Sprintf("[local] Party A started (PID %d)", cmdA.Process.Pid))
 	}
 
+	// Wait briefly and verify processes are still alive.
+	// Use channels to detect early exit — if `go run` exits within 5s, the process crashed.
+	waitExit := func(cmd *exec.Cmd, name string) <-chan error {
+		ch := make(chan error, 1)
+		if cmd == nil || cmd.Process == nil {
+			ch <- fmt.Errorf("%s was not started", name)
+			return ch
+		}
+		go func() { ch <- cmd.Wait() }()
+		return ch
+	}
+	exitB := waitExit(cmdB, "Party B")
+	exitA := waitExit(cmdA, "Party A")
+
+	// Give processes 5s to start up. If they exit in that window, they crashed.
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	var procErrors []string
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-exitB:
+			exitB = nil // don't read again
+			procErrors = append(procErrors, fmt.Sprintf("Party B exited early: %v", err))
+		case err := <-exitA:
+			exitA = nil
+			procErrors = append(procErrors, fmt.Sprintf("Party A exited early: %v", err))
+		case <-timer.C:
+			i = 2 // break loop — processes survived the startup window
+		}
+	}
+	if len(procErrors) > 0 {
+		for _, e := range procErrors {
+			logFn(fmt.Sprintf("[local] ERROR: %s", e))
+		}
+		return fmt.Errorf("processes failed to stay running: %s", strings.Join(procErrors, "; "))
+	}
+
 	logFn("[local] Local deployment complete.")
 	logFn(fmt.Sprintf("[local] Config directory: %s", baseDir))
+	return nil
+}
+
+// killExistingParties finds and kills any running party-a/party-b processes from a previous deploy.
+func killExistingParties(logFn func(string)) {
+	killed := false
+	for _, pattern := range []string{"party-a", "party-b"} {
+		// Try both the binary name and the go run pattern.
+		exec.Command("pkill", "-f", pattern).Run()
+	}
+	// Check if ports are now free.
+	for _, port := range []string{"8080", "9000"} {
+		out, _ := exec.Command("lsof", "-ti", ":"+port).Output()
+		pids := strings.TrimSpace(string(out))
+		if pids != "" {
+			for _, pid := range strings.Split(pids, "\n") {
+				exec.Command("kill", pid).Run()
+				killed = true
+			}
+		}
+	}
+	if killed {
+		logFn("[local] Killed existing party processes.")
+		time.Sleep(1 * time.Second) // let ports release
+	}
+}
+
+// ensureLocalPostgres creates the crypto_claw PostgreSQL role and databases if they don't exist.
+func ensureLocalPostgres(logFn func(string)) error {
+	// Check if psql is available.
+	if _, err := exec.LookPath("psql"); err != nil {
+		return fmt.Errorf("psql not found — please install PostgreSQL")
+	}
+
+	// Check if PostgreSQL is running.
+	out, err := exec.Command("pg_isready").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("PostgreSQL is not running: %s", strings.TrimSpace(string(out)))
+	}
+
+	// Create role if it doesn't exist.
+	roleCheck, _ := exec.Command("psql", "-tAc",
+		"SELECT 1 FROM pg_roles WHERE rolname='crypto_claw'", "postgres").Output()
+	if strings.TrimSpace(string(roleCheck)) != "1" {
+		logFn("[local] Creating PostgreSQL role 'crypto_claw'...")
+		out, err := exec.Command("psql", "-c",
+			"CREATE ROLE crypto_claw WITH LOGIN PASSWORD 'crypto_claw'", "postgres").CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("create role: %s: %w", strings.TrimSpace(string(out)), err)
+		}
+	} else {
+		logFn("[local] PostgreSQL role 'crypto_claw' already exists.")
+	}
+
+	// Create databases if they don't exist.
+	for _, dbName := range []string{"crypto_claw_a", "crypto_claw_b"} {
+		dbCheck, _ := exec.Command("psql", "-tAc",
+			fmt.Sprintf("SELECT 1 FROM pg_database WHERE datname='%s'", dbName), "postgres").Output()
+		if strings.TrimSpace(string(dbCheck)) != "1" {
+			logFn(fmt.Sprintf("[local] Creating database '%s'...", dbName))
+			out, err := exec.Command("createdb", "-O", "crypto_claw", dbName).CombinedOutput()
+			if err != nil {
+				return fmt.Errorf("create database %s: %s: %w", dbName, strings.TrimSpace(string(out)), err)
+			}
+		} else {
+			logFn(fmt.Sprintf("[local] Database '%s' already exists.", dbName))
+		}
+	}
+
+	logFn("[local] PostgreSQL setup complete.")
 	return nil
 }
 

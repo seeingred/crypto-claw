@@ -56,6 +56,9 @@ func TestE2E_LocalInstall(t *testing.T) {
 		t.Skip("skipping E2E test in short mode (needs safe prime generation)")
 	}
 
+	// Skip starting party processes in local deploy (no PostgreSQL in test env).
+	t.Setenv("CRYPTO_CLAW_NO_PROCESSES", "1")
+
 	ppA, ppB := ensurePreParams(t)
 
 	// Set up state with pre-params injected to skip background generation.

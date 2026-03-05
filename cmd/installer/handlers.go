@@ -460,12 +460,17 @@ func handleDeploy(state *WizardState) http.HandlerFunc {
 			state.DeployFailed = failed
 			if !failed {
 				state.Step = "done"
-				logFn("Deployment finished successfully.")
 			} else {
 				state.Step = "deploying" // stay on install step
-				logFn("Deployment finished with errors.")
 			}
 			state.mu.Unlock()
+
+			// Log AFTER releasing the lock to avoid deadlock (logFn -> AppendLog -> state.mu.Lock).
+			if !failed {
+				logFn("Deployment finished successfully.")
+			} else {
+				logFn("Deployment finished with errors.")
+			}
 		}()
 
 		writeJSON(w, http.StatusOK, map[string]string{"status": "started"})
