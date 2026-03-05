@@ -1,0 +1,128 @@
+package config
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+)
+
+// Config holds the complete configuration for both parties.
+type Config struct {
+	Party    string       `json:"party"` // "a" or "b"
+	DataDir  string       `json:"dataDir"`
+	Database DatabaseConfig `json:"database"`
+
+	// Party A specific
+	API       APIConfig       `json:"api,omitempty"`
+	Transport TransportConfig `json:"transport"`
+	Chains    ChainsConfig    `json:"chains,omitempty"`
+
+	// Party B specific
+	Analyzer AnalyzerConfig `json:"analyzer,omitempty"`
+	Telegram TelegramConfig `json:"telegram,omitempty"`
+}
+
+type DatabaseConfig struct {
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	User     string `json:"user"`
+	Password string `json:"password"`
+	DBName   string `json:"dbName"`
+	SSLMode  string `json:"sslMode"`
+}
+
+func (d DatabaseConfig) DSN() string {
+	return fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=%s",
+		d.User, d.Password, d.Host, d.Port, d.DBName, d.SSLMode)
+}
+
+type APIConfig struct {
+	ListenAddr string `json:"listenAddr"` // e.g. "127.0.0.1:8080"
+	WebDir     string `json:"webDir"`     // path to embedded web dashboard
+}
+
+type TransportConfig struct {
+	// Party A uses these to connect to Party B
+	RemoteAddr string `json:"remoteAddr,omitempty"` // Party B's address
+
+	// Party B uses this to listen
+	ListenAddr string `json:"listenAddr,omitempty"`
+
+	// TLS settings
+	CertFile   string `json:"certFile"`
+	KeyFile    string `json:"keyFile"`
+	CACertFile string `json:"caCertFile"` // Peer's CA cert for pinning
+}
+
+type ChainsConfig struct {
+	EVM        []EVMChainConfig        `json:"evm,omitempty"`
+	Solana     []SolanaChainConfig     `json:"solana,omitempty"`
+	Tendermint []TendermintChainConfig `json:"tendermint,omitempty"`
+}
+
+type EVMChainConfig struct {
+	Name       string `json:"name"`    // e.g. "ethereum", "polygon"
+	ChainID    int64  `json:"chainId"` // e.g. 1, 137
+	RPCURL     string `json:"rpcUrl"`
+	ExplorerAPI string `json:"explorerApi,omitempty"` // e.g. etherscan API URL
+	ExplorerKey string `json:"explorerKey,omitempty"`
+}
+
+type SolanaChainConfig struct {
+	Name   string `json:"name"`   // e.g. "solana-mainnet"
+	RPCURL string `json:"rpcUrl"` // e.g. "https://api.mainnet-beta.solana.com"
+}
+
+type TendermintChainConfig struct {
+	Name    string `json:"name"`    // e.g. "cosmoshub"
+	ChainID string `json:"chainId"` // e.g. "cosmoshub-4"
+	RPCURL  string `json:"rpcUrl"`
+	Denom   string `json:"denom"` // e.g. "uatom"
+	Prefix  string `json:"prefix"` // e.g. "cosmos"
+}
+
+type AnalyzerConfig struct {
+	LLM          LLMConfig `json:"llm"`
+	AutoMode     bool      `json:"autoMode"`     // true = AI decides, false = manual approval
+	ExplorerAPIs map[string]string `json:"explorerApis"` // chain -> API key
+}
+
+type LLMConfig struct {
+	Provider string `json:"provider"` // "openai", "anthropic", "local"
+	APIKey   string `json:"apiKey,omitempty"`
+	Endpoint string `json:"endpoint,omitempty"` // for local models
+	Model    string `json:"model"`              // e.g. "gpt-4", "claude-sonnet-4-20250514"
+}
+
+type TelegramConfig struct {
+	BotToken         string        `json:"botToken"`
+	AuthorizedUserID int64         `json:"authorizedUserId"`
+	EscalationTimeout time.Duration `json:"escalationTimeout"` // default reject after this
+}
+
+// Load reads config from a JSON file.
+func Load(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	if cfg.DataDir == "" {
+		cfg.DataDir = filepath.Dir(path)
+	}
+	return &cfg, nil
+}
+
+// Save writes config to a JSON file.
+func Save(path string, cfg *Config) error {
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	return os.WriteFile(path, data, 0600)
+}

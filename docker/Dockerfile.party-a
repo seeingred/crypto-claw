@@ -1,0 +1,18 @@
+FROM golang:1.25-alpine AS builder
+
+RUN apk add --no-cache git
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /party-a ./cmd/party-a
+
+FROM alpine:3.21
+RUN apk add --no-cache ca-certificates
+COPY --from=builder /party-a /usr/local/bin/party-a
+
+EXPOSE 8080
+ENTRYPOINT ["party-a"]
+CMD ["-config", "/etc/crypto-claw/config.json", "-passphrase", ""]
