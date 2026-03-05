@@ -105,6 +105,24 @@ func (p *TSSProtocol) runSignLoop(
 	errCh <-chan *tss.Error,
 	router MessageRouter,
 ) (*Signature, error) {
+	routeErrCh := make(chan error, 1)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case msg, ok := <-outCh:
+				if !ok {
+					return
+				}
+				if err := routeMessage(ctx, msg, sortedIDs, router); err != nil {
+					routeErrCh <- err
+					return
+				}
+			}
+		}
+	}()
+
 	incoming := router.Receive()
 
 	for {
@@ -115,10 +133,8 @@ func (p *TSSProtocol) runSignLoop(
 		case err := <-errCh:
 			return nil, ErrSigningFailed.WithCause(fmt.Errorf("tss error: %s", err.Error()))
 
-		case msg := <-outCh:
-			if err := routeMessage(ctx, msg, sortedIDs, router); err != nil {
-				return nil, ErrSigningFailed.WithCause(err)
-			}
+		case err := <-routeErrCh:
+			return nil, ErrSigningFailed.WithCause(fmt.Errorf("route error: %w", err))
 
 		case in, ok := <-incoming:
 			if !ok {

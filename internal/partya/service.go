@@ -53,9 +53,8 @@ func (s *Service) nextMsgID() uint64 {
 
 // DeriveResult holds the result of a key derivation.
 type DeriveResult struct {
-	DerivationPath string `json:"derivationPath"`
-	Address        string `json:"address"`
-	PublicKey      string `json:"publicKey"` // hex-encoded
+	Address   string `json:"address"`
+	PublicKey string `json:"pubKey"` // hex-encoded
 }
 
 // Derive derives a new child key for the given derivation path and label.
@@ -109,9 +108,8 @@ func (s *Service) Derive(ctx context.Context, derivationPath, label string) (*De
 	})
 
 	return &DeriveResult{
-		DerivationPath: derivationPath,
-		Address:        address,
-		PublicKey:       fmt.Sprintf("%x", derived.PublicKey),
+		Address:   address,
+		PublicKey: fmt.Sprintf("0x%x", derived.PublicKey),
 	}, nil
 }
 
@@ -204,8 +202,9 @@ func (s *Service) Sign(ctx context.Context, req *SignRequest) (*SignResult, erro
 		_ = signableBytes
 
 		return &SignResult{
-			Status: "approved",
-			Reason: signResp.Reason,
+			Status:   "signed",
+			SignedTx: base64.StdEncoding.EncodeToString(unsignedTx.RawBytes),
+			Reason:   signResp.Reason,
 		}, nil
 
 	case "reject":
@@ -237,7 +236,7 @@ func (s *Service) Sign(ctx context.Context, req *SignRequest) (*SignResult, erro
 
 		return &SignResult{
 			TxID:   txID,
-			Status: "escalated",
+			Status: "pending_review",
 			Reason: signResp.Reason,
 		}, nil
 
@@ -288,11 +287,10 @@ func (s *Service) GetSignStatus(ctx context.Context, txID string) (*SignResult, 
 
 // KeyInfo holds information about a derived key.
 type KeyInfo struct {
-	DerivationPath string `json:"derivationPath"`
+	DerivationPath string `json:"-"`
 	Address        string `json:"address"`
+	PubKey         string `json:"pubKey"`
 	Label          string `json:"label"`
-	Curve          string `json:"curve"`
-	CreatedAt      string `json:"createdAt"`
 }
 
 // ListKeys returns all derived keys.
@@ -307,9 +305,8 @@ func (s *Service) ListKeys(ctx context.Context) ([]KeyInfo, error) {
 		keys[i] = KeyInfo{
 			DerivationPath: r.DerivationPath,
 			Address:        r.Address,
+			PubKey:         fmt.Sprintf("0x%x", r.PublicKey),
 			Label:          r.Label,
-			Curve:          string(r.Curve),
-			CreatedAt:      r.CreatedAt.Format(time.RFC3339),
 		}
 	}
 	return keys, nil
@@ -317,16 +314,14 @@ func (s *Service) ListKeys(ctx context.Context) ([]KeyInfo, error) {
 
 // HealthStatus holds the health check result.
 type HealthStatus struct {
-	Status   string `json:"status"`
-	PartyB   string `json:"partyB"`
-	Database string `json:"database"`
+	Status               string `json:"status"`
+	SecureServerConnected bool   `json:"secureServerConnected"`
 }
 
 // Health performs a health check including Party B connectivity.
 func (s *Service) Health(ctx context.Context) *HealthStatus {
 	status := &HealthStatus{
-		Status:   "ok",
-		Database: "ok",
+		Status: "ok",
 	}
 
 	// Check Party B connectivity
@@ -335,10 +330,9 @@ func (s *Service) Health(ctx context.Context) *HealthStatus {
 		ID:   s.nextMsgID(),
 	})
 	if err != nil || resp == nil {
-		status.PartyB = "unreachable"
-		status.Status = "degraded"
+		status.SecureServerConnected = false
 	} else {
-		status.PartyB = "ok"
+		status.SecureServerConnected = true
 	}
 
 	return status

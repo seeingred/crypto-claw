@@ -27,13 +27,22 @@ type HardhatNode struct {
 func StartHardhat(t *testing.T, contractsDir string) *HardhatNode {
 	t.Helper()
 
+	// Resolve contractsDir relative to the project root (go.mod location).
+	absDir := contractsDir
+	if !filepath.IsAbs(absDir) {
+		root := findProjectRoot(t)
+		absDir = filepath.Join(root, absDir)
+	}
+
 	port := findFreePort(t)
 	rpcURL := fmt.Sprintf("http://127.0.0.1:%d", port)
 
 	cmd := exec.Command("npx", "hardhat", "node", "--port", fmt.Sprintf("%d", port))
-	cmd.Dir = contractsDir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Dir = absDir
+	// Discard Hardhat output to avoid "I/O incomplete" errors when the
+	// test kills the process and the pipe doesn't close cleanly.
+	cmd.Stdout = nil
+	cmd.Stderr = nil
 
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start hardhat: %v", err)
@@ -43,7 +52,7 @@ func StartHardhat(t *testing.T, contractsDir string) *HardhatNode {
 		cmd:     cmd,
 		RPCURL:  rpcURL,
 		ChainID: 31337,
-		dir:     contractsDir,
+		dir:     absDir,
 	}
 
 	t.Cleanup(func() {
@@ -66,18 +75,20 @@ func StartHardhat(t *testing.T, contractsDir string) *HardhatNode {
 func (h *HardhatNode) DeployContract(t *testing.T, contractName string, args ...string) string {
 	t.Helper()
 
-	// Build a deploy script dynamically.
+	// Build a deploy script that connects to our specific node URL.
 	scriptContent := fmt.Sprintf(`
 const hre = require("hardhat");
 async function main() {
+  const provider = new hre.ethers.JsonRpcProvider("%s");
+  const signer = await provider.getSigner();
   const Factory = await hre.ethers.getContractFactory("%s");
-  const contract = await Factory.deploy(%s);
+  const contract = await Factory.connect(signer).deploy(%s);
   await contract.waitForDeployment();
   const addr = await contract.getAddress();
   console.log("DEPLOYED:" + addr);
 }
 main().catch(console.error).then(() => process.exit(0));
-`, contractName, strings.Join(args, ", "))
+`, h.RPCURL, contractName, strings.Join(args, ", "))
 
 	scriptPath := filepath.Join(h.dir, "scripts", "deploy-test.js")
 	if err := os.MkdirAll(filepath.Dir(scriptPath), 0755); err != nil {
@@ -88,7 +99,7 @@ main().catch(console.error).then(() => process.exit(0));
 	}
 	defer os.Remove(scriptPath)
 
-	cmd := exec.Command("npx", "hardhat", "run", scriptPath, "--network", "localhost")
+	cmd := exec.Command("npx", "hardhat", "run", scriptPath)
 	cmd.Dir = h.dir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -168,6 +179,42 @@ func (h *HardhatNode) SendRawTx(t *testing.T, rawTxHex string) string {
 	return txHash
 }
 
+// EthCall performs an eth_call and returns the raw result hex string.
+func (h *HardhatNode) EthCall(t *testing.T, to, data string) string {
+	t.Helper()
+	payload := fmt.Sprintf(`{"jsonrpc":"2.0","method":"eth_call","params":[{"to":"%s","data":"%s"},"latest"],"id":1}`, to, data)
+	resp, err := jsonRPCCall(h.RPCURL, payload)
+	if err != nil {
+		t.Fatalf("eth_call: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("eth_call rpc error: code=%d msg=%s", resp.Error.Code, resp.Error.Message)
+	}
+	var result string
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		t.Fatalf("parse eth_call result: %v", err)
+	}
+	return result
+}
+
+// SendTx sends a transaction from a Hardhat default account.
+func (h *HardhatNode) SendTx(t *testing.T, from, to, data string) string {
+	t.Helper()
+	payload := fmt.Sprintf(`{"jsonrpc":"2.0","method":"eth_sendTransaction","params":[{"from":"%s","to":"%s","data":"%s","gas":"0x100000"}],"id":1}`, from, to, data)
+	resp, err := jsonRPCCall(h.RPCURL, payload)
+	if err != nil {
+		t.Fatalf("send tx: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("send tx rpc error: code=%d msg=%s", resp.Error.Code, resp.Error.Message)
+	}
+	var txHash string
+	if err := json.Unmarshal(resp.Result, &txHash); err != nil {
+		t.Fatalf("parse tx hash: %v", err)
+	}
+	return txHash
+}
+
 // JSON-RPC helpers.
 
 type rpcResponse struct {
@@ -222,4 +269,23 @@ func findFreePort(t *testing.T) int {
 	port := l.Addr().(*net.TCPAddr).Port
 	l.Close()
 	return port
+}
+
+// findProjectRoot walks up from the current working directory to find go.mod.
+func findProjectRoot(t *testing.T) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatal("getwd:", err)
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatal("could not find project root (go.mod)")
+		}
+		dir = parent
+	}
 }

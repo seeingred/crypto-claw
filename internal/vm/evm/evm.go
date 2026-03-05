@@ -75,6 +75,13 @@ func (a *Adapter) BuildUnsignedTx(_ context.Context, req *vm.TxRequest) (*vm.Uns
 	}
 
 	to := common.HexToAddress(req.To[0])
+
+	// Set V = chainId*2 + 35 (EIP-155 unsigned convention) so that
+	// tx.ChainId() correctly recovers the chainId when decoding later.
+	eip155V := new(big.Int).Add(
+		new(big.Int).Mul(chainID, big.NewInt(2)),
+		big.NewInt(35),
+	)
 	tx := types.NewTx(&types.LegacyTx{
 		Nonce:    req.Nonce,
 		To:       &to,
@@ -82,6 +89,9 @@ func (a *Adapter) BuildUnsignedTx(_ context.Context, req *vm.TxRequest) (*vm.Uns
 		Gas:      gasLimit,
 		GasPrice: gasPrice,
 		Data:     req.Data,
+		V:        eip155V,
+		R:        new(big.Int),
+		S:        new(big.Int),
 	})
 
 	signer := types.NewEIP155Signer(chainID)
@@ -128,12 +138,16 @@ func (a *Adapter) AssembleSignedTx(unsignedTx []byte, sig *tss.Signature) ([]byt
 	chainID := tx.ChainId()
 	signer := types.NewEIP155Signer(chainID)
 
-	// EIP-155: v = chainID * 2 + 35 + recovery_id
-	v := new(big.Int).SetInt64(int64(sig.V))
-	v.Add(v, new(big.Int).Mul(chainID, big.NewInt(2)))
-	v.Add(v, big.NewInt(35))
+	// Build 65-byte signature: R (32 bytes) || S (32 bytes) || V (1 byte).
+	// R and S must be zero-padded to 32 bytes each.
+	sigBytes := make([]byte, 65)
+	rBytes := sig.R.Bytes()
+	sBytes := sig.S.Bytes()
+	copy(sigBytes[32-len(rBytes):32], rBytes)
+	copy(sigBytes[64-len(sBytes):64], sBytes)
+	sigBytes[64] = sig.V
 
-	signedTx, err := tx.WithSignature(signer, append(append(sig.R.Bytes(), sig.S.Bytes()...), byte(sig.V)))
+	signedTx, err := tx.WithSignature(signer, sigBytes)
 	if err != nil {
 		return nil, fmt.Errorf("evm: apply signature: %w", err)
 	}

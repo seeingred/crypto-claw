@@ -109,7 +109,7 @@ func (h *apiHandler) handleSign(w http.ResponseWriter, r *http.Request) {
 	}
 
 	status := http.StatusOK
-	if result.Status == "escalated" {
+	if result.Status == "pending_review" {
 		status = http.StatusAccepted
 	}
 	writeJSON(w, status, result)
@@ -138,7 +138,12 @@ func (h *apiHandler) handleListKeys(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, keys)
+	keysMap := make(map[string]KeyInfo, len(keys))
+	for _, k := range keys {
+		keysMap[k.DerivationPath] = k
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{"keys": keysMap})
 }
 
 type updateLabelRequest struct {
@@ -163,7 +168,7 @@ func (h *apiHandler) handleUpdateLabel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (h *apiHandler) handleHealth(w http.ResponseWriter, r *http.Request) {

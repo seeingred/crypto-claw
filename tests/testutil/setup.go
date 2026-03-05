@@ -2,6 +2,7 @@
 package testutil
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -14,10 +15,13 @@ import (
 	"fmt"
 	"math/big"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/bnb-chain/tss-lib/v2/ecdsa/keygen"
 
 	"github.com/seeingred/crypto-claw/internal/config"
 	"github.com/seeingred/crypto-claw/internal/tss"
@@ -25,12 +29,13 @@ import (
 
 // TestParty represents a test party (A or B) running in-process.
 type TestParty struct {
-	ID       string
-	PartyID  tss.PartyID
-	Config   *config.Config
-	CertDir  string
-	KeyShare map[tss.Curve]*tss.KeyShare // populated after DKG
-	mu       sync.Mutex
+	ID            string
+	PartyID       tss.PartyID
+	Config        *config.Config
+	CertDir       string
+	KeyShare      map[tss.Curve]*tss.KeyShare // populated after DKG
+	DerivedShares map[string][]byte           // derivation path -> serialized share data
+	mu            sync.Mutex
 }
 
 // TestCluster holds a pair of test parties wired together.
@@ -84,7 +89,8 @@ func NewTestCluster(t *testing.T) *TestCluster {
 				},
 			},
 		},
-		KeyShare: make(map[tss.Curve]*tss.KeyShare),
+		KeyShare:      make(map[tss.Curve]*tss.KeyShare),
+		DerivedShares: make(map[string][]byte),
 	}
 
 	partyB := &TestParty{
@@ -101,7 +107,8 @@ func NewTestCluster(t *testing.T) *TestCluster {
 				CACertFile: filepath.Join(certDirB, "ca.pem"),
 			},
 		},
-		KeyShare: make(map[tss.Curve]*tss.KeyShare),
+		KeyShare:      make(map[tss.Curve]*tss.KeyShare),
+		DerivedShares: make(map[string][]byte),
 	}
 
 	if err := os.MkdirAll(partyA.Config.DataDir, 0700); err != nil {
@@ -132,6 +139,21 @@ func (p *TestParty) GetKeyShare(curve tss.Curve) (*tss.KeyShare, bool) {
 	defer p.mu.Unlock()
 	ks, ok := p.KeyShare[curve]
 	return ks, ok
+}
+
+// SetDerivedShare stores a derived key share for a derivation path.
+func (p *TestParty) SetDerivedShare(path string, share []byte) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.DerivedShares[path] = share
+}
+
+// GetDerivedShare retrieves a stored derived key share.
+func (p *TestParty) GetDerivedShare(path string) ([]byte, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	s, ok := p.DerivedShares[path]
+	return s, ok
 }
 
 // InMemoryRouter is a simple in-process message router for testing TSS protocols
@@ -340,4 +362,186 @@ func GenerateTestECDSAKey(t *testing.T) *ecdsa.PrivateKey {
 		t.Fatal("generate ecdsa key:", err)
 	}
 	return key
+}
+
+// RunDerive runs HD key derivation for both parties and verifies the derived
+// public keys match. The derived shares are stored in each party's DerivedShares map.
+func RunDerive(ctx context.Context, t *testing.T, cluster *TestCluster, protocol tss.Protocol, curve tss.Curve, derivationPath string) (pubKeyA, pubKeyB []byte) {
+	t.Helper()
+
+	shareA, ok := cluster.PartyA.GetKeyShare(curve)
+	if !ok {
+		t.Fatalf("party A has no %s key share for derivation", curve)
+	}
+	shareB, ok := cluster.PartyB.GetKeyShare(curve)
+	if !ok {
+		t.Fatalf("party B has no %s key share for derivation", curve)
+	}
+
+	derivedA, err := protocol.DeriveKey(ctx, shareA, derivationPath)
+	if err != nil {
+		t.Fatalf("derive key A: %v", err)
+	}
+
+	derivedB, err := protocol.DeriveKey(ctx, shareB, derivationPath)
+	if err != nil {
+		t.Fatalf("derive key B: %v", err)
+	}
+
+	if !bytes.Equal(derivedA.PublicKey, derivedB.PublicKey) {
+		t.Fatalf("derived public keys do not match for path %s", derivationPath)
+	}
+
+	cluster.PartyA.SetDerivedShare(derivationPath, derivedA.Share)
+	cluster.PartyB.SetDerivedShare(derivationPath, derivedB.Share)
+
+	return derivedA.PublicKey, derivedB.PublicKey
+}
+
+// RunSign runs threshold signing for both parties using an in-memory router.
+// If derivationPath is non-empty and derived shares exist, those are used;
+// otherwise master shares are used.
+func RunSign(ctx context.Context, t *testing.T, cluster *TestCluster, protocol tss.Protocol, curve tss.Curve, message []byte, derivationPath string) *tss.Signature {
+	t.Helper()
+
+	var keyShareA, keyShareB []byte
+
+	if derivationPath != "" {
+		if ds, ok := cluster.PartyA.GetDerivedShare(derivationPath); ok {
+			keyShareA = ds
+		}
+		if ds, ok := cluster.PartyB.GetDerivedShare(derivationPath); ok {
+			keyShareB = ds
+		}
+	}
+
+	if keyShareA == nil {
+		share, ok := cluster.PartyA.GetKeyShare(curve)
+		if !ok {
+			t.Fatalf("party A has no %s key share for signing", curve)
+		}
+		keyShareA = share.Share
+	}
+	if keyShareB == nil {
+		share, ok := cluster.PartyB.GetKeyShare(curve)
+		if !ok {
+			t.Fatalf("party B has no %s key share for signing", curve)
+		}
+		keyShareB = share.Share
+	}
+
+	router := NewInMemoryRouter()
+	parties := cluster.Parties()
+
+	signReq := tss.SignRequest{
+		DerivationPath: derivationPath,
+		Message:        message,
+		Curve:          curve,
+	}
+
+	var wg sync.WaitGroup
+	var errA, errB error
+	var sigA, sigB *tss.Signature
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		sigA, errA = protocol.Sign(ctx, signReq, keyShareA, cluster.PartyA.PartyID, parties, router.ForParty(cluster.PartyA.PartyID))
+	}()
+	go func() {
+		defer wg.Done()
+		sigB, errB = protocol.Sign(ctx, signReq, keyShareB, cluster.PartyB.PartyID, parties, router.ForParty(cluster.PartyB.PartyID))
+	}()
+
+	wg.Wait()
+
+	if errA != nil {
+		t.Fatalf("sign party A failed: %v", errA)
+	}
+	if errB != nil {
+		t.Fatalf("sign party B failed: %v", errB)
+	}
+
+	// Both parties should produce the same signature.
+	if sigA.R.Cmp(sigB.R) != 0 || sigA.S.Cmp(sigB.S) != 0 {
+		t.Fatal("signatures from party A and B do not match")
+	}
+
+	return sigA
+}
+
+// RequireHardhat skips the test if npx and hardhat are not available.
+func RequireHardhat(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("npx"); err != nil {
+		t.Skip("npx not found, skipping hardhat test")
+	}
+	cmd := exec.Command("npx", "hardhat", "--version")
+	if err := cmd.Run(); err != nil {
+		t.Skip("hardhat not available, skipping hardhat test")
+	}
+}
+
+// RequireSolana skips the test if solana-test-validator is not available.
+func RequireSolana(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("solana-test-validator"); err != nil {
+		t.Skip("solana-test-validator not found, skipping solana test")
+	}
+}
+
+// GenerateTestPreParams generates ECDSA pre-parameters for both test parties.
+// This is CPU-intensive (1-2 minutes) but only needs to run once per test suite.
+func GenerateTestPreParams(t *testing.T) map[string]*keygen.LocalPreParams {
+	t.Helper()
+	t.Log("Generating ECDSA pre-params (this may take 1-2 minutes)...")
+
+	var wg sync.WaitGroup
+	var ppA, ppB *keygen.LocalPreParams
+	var errA, errB error
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		ppA, errA = keygen.GeneratePreParams(10 * time.Minute)
+	}()
+	go func() {
+		defer wg.Done()
+		ppB, errB = keygen.GeneratePreParams(10 * time.Minute)
+	}()
+
+	wg.Wait()
+
+	if errA != nil {
+		t.Fatalf("generate pre-params for party-a: %v", errA)
+	}
+	if errB != nil {
+		t.Fatalf("generate pre-params for party-b: %v", errB)
+	}
+
+	if !ppA.Validate() {
+		t.Fatal("pre-params for party-a failed validation")
+	}
+	if !ppB.Validate() {
+		t.Fatal("pre-params for party-b failed validation")
+	}
+
+	return map[string]*keygen.LocalPreParams{
+		"party-a": ppA,
+		"party-b": ppB,
+	}
+}
+
+// NewTestProtocolWithPreParams creates a TSSProtocol with cached pre-params
+// so that ECDSA DKG does not need to generate safe primes each time.
+func NewTestProtocolWithPreParams(preParams map[string]*keygen.LocalPreParams) *tss.TSSProtocol {
+	p := tss.NewProtocol(0)
+	p.GetPreParams = func(partyID tss.PartyID) (*keygen.LocalPreParams, error) {
+		pp, ok := preParams[partyID.ID]
+		if !ok {
+			return nil, fmt.Errorf("no pre-params for party %s", partyID.ID)
+		}
+		return pp, nil
+	}
+	return p
 }

@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Hardhat
+contracts/evm/artifacts/
+contracts/evm/cache/
+
+# Go
+*.exe
+*.test
+*.out
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env
+.env.*
+*.pem
+!*_test.go
+
+# Build
+dist/
+build/

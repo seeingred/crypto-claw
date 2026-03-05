@@ -3,7 +3,7 @@ package tss
 import (
 	"context"
 	"crypto/elliptic"
-	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"math/big"
@@ -19,6 +19,8 @@ import (
 // TSSProtocol implements the Protocol interface using bnb-chain/tss-lib.
 type TSSProtocol struct {
 	Threshold int // t in (t, n) threshold scheme; defaults to n-1 (2-of-2) if 0
+	// GetPreParams optionally returns cached pre-params for a party (speeds up DKG in tests).
+	GetPreParams func(partyID PartyID) (*keygen.LocalPreParams, error)
 }
 
 // NewProtocol creates a new TSS protocol handler.
@@ -81,25 +83,31 @@ func (p *TSSProtocol) dkgECDSA(ctx context.Context, partyID PartyID, parties []P
 	endCh := make(chan *keygen.LocalPartySaveData, 1)
 	errCh := make(chan *tss.Error, 1)
 
-	party := keygen.NewLocalParty(params, outCh, endCh)
-
-	// Pre-generate safe primes for key generation.
-	preParams, err := keygen.GeneratePreParams(10 * time.Minute)
-	if err != nil {
-		return nil, ErrDKGFailed.WithCause(fmt.Errorf("generate pre-params: %w", err))
+	// Get or generate safe primes for key generation.
+	var preParams *keygen.LocalPreParams
+	if p.GetPreParams != nil {
+		var ppErr error
+		preParams, ppErr = p.GetPreParams(partyID)
+		if ppErr != nil {
+			return nil, ErrDKGFailed.WithCause(fmt.Errorf("get pre-params: %w", ppErr))
+		}
+	} else {
+		var ppErr error
+		preParams, ppErr = keygen.GeneratePreParams(10 * time.Minute)
+		if ppErr != nil {
+			return nil, ErrDKGFailed.WithCause(fmt.Errorf("generate pre-params: %w", ppErr))
+		}
 	}
 
-	partyWithPreParams := keygen.NewLocalParty(params, outCh, endCh, *preParams)
-	_ = party
-	party = nil
+	party := keygen.NewLocalParty(params, outCh, endCh, *preParams)
 
 	go func() {
-		if err := partyWithPreParams.Start(); err != nil {
+		if err := party.Start(); err != nil {
 			errCh <- err
 		}
 	}()
 
-	return p.runDKGLoop(ctx, CurveSecp256k1, partyWithPreParams, sortedIDs, outCh, endCh, errCh, router)
+	return p.runDKGLoop(ctx, CurveSecp256k1, party, sortedIDs, outCh, endCh, errCh, router)
 }
 
 func (p *TSSProtocol) dkgEdDSA(ctx context.Context, partyID PartyID, parties []PartyID, threshold int, router MessageRouter) (*KeyShare, error) {
@@ -137,6 +145,28 @@ func (p *TSSProtocol) runDKGLoop(
 	errCh <-chan *tss.Error,
 	router MessageRouter,
 ) (*KeyShare, error) {
+	// Route outgoing messages in a dedicated goroutine to prevent deadlock.
+	// When UpdateFromBytes triggers a new round, the party sends to outCh.
+	// If the main loop is blocked in handleIncoming at that moment, outCh
+	// could fill up and block the party, causing a deadlock.
+	routeErrCh := make(chan error, 1)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case msg, ok := <-outCh:
+				if !ok {
+					return
+				}
+				if err := routeMessage(ctx, msg, sortedIDs, router); err != nil {
+					routeErrCh <- err
+					return
+				}
+			}
+		}
+	}()
+
 	incoming := router.Receive()
 
 	for {
@@ -147,10 +177,8 @@ func (p *TSSProtocol) runDKGLoop(
 		case err := <-errCh:
 			return nil, ErrDKGFailed.WithCause(fmt.Errorf("tss error: %s", err.Error()))
 
-		case msg := <-outCh:
-			if err := routeMessage(ctx, msg, sortedIDs, router); err != nil {
-				return nil, ErrDKGFailed.WithCause(err)
-			}
+		case err := <-routeErrCh:
+			return nil, ErrDKGFailed.WithCause(fmt.Errorf("route error: %w", err))
 
 		case incoming, ok := <-incoming:
 			if !ok {
@@ -175,6 +203,24 @@ func (p *TSSProtocol) runEdDSADKGLoop(
 	errCh <-chan *tss.Error,
 	router MessageRouter,
 ) (*KeyShare, error) {
+	routeErrCh := make(chan error, 1)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case msg, ok := <-outCh:
+				if !ok {
+					return
+				}
+				if err := routeMessage(ctx, msg, sortedIDs, router); err != nil {
+					routeErrCh <- err
+					return
+				}
+			}
+		}
+	}()
+
 	incoming := router.Receive()
 
 	for {
@@ -185,10 +231,8 @@ func (p *TSSProtocol) runEdDSADKGLoop(
 		case err := <-errCh:
 			return nil, ErrDKGFailed.WithCause(fmt.Errorf("tss error: %s", err.Error()))
 
-		case msg := <-outCh:
-			if err := routeMessage(ctx, msg, sortedIDs, router); err != nil {
-				return nil, ErrDKGFailed.WithCause(err)
-			}
+		case err := <-routeErrCh:
+			return nil, ErrDKGFailed.WithCause(fmt.Errorf("route error: %w", err))
 
 		case incoming, ok := <-incoming:
 			if !ok {
@@ -276,18 +320,16 @@ func marshalECDSAKeyShare(curve Curve, pid *tss.PartyID, save *keygen.LocalParty
 	x, y := pubKey.X(), pubKey.Y()
 	pubKeyBytes := elliptic.Marshal(tss.S256(), x, y)
 
-	// Generate a chain code for HD derivation.
-	chainCode := make([]byte, 32)
-	if _, err := rand.Read(chainCode); err != nil {
-		return nil, ErrDKGFailed.WithCause(fmt.Errorf("generate chain code: %w", err))
-	}
+	// Derive chain code deterministically from the public key so both parties
+	// compute the same value (required for HD derivation to be consistent).
+	chainCode := sha256.Sum256(pubKeyBytes)
 
 	return &KeyShare{
 		Curve:     curve,
 		PartyID:   PartyID{ID: pid.Id, Index: pid.Index},
 		Share:     shareData,
 		PublicKey: pubKeyBytes,
-		ChainCode: chainCode,
+		ChainCode: chainCode[:],
 	}, nil
 }
 
@@ -303,17 +345,14 @@ func marshalEdDSAKeyShare(pid *tss.PartyID, save *edkeygen.LocalPartySaveData) (
 	xBytes := pubKey.X().Bytes()
 	copy(pubKeyBytes[32-len(xBytes):], xBytes)
 
-	chainCode := make([]byte, 32)
-	if _, err := rand.Read(chainCode); err != nil {
-		return nil, ErrDKGFailed.WithCause(fmt.Errorf("generate chain code: %w", err))
-	}
+	chainCode := sha256.Sum256(pubKeyBytes)
 
 	return &KeyShare{
 		Curve:     CurveEd25519,
 		PartyID:   PartyID{ID: pid.Id, Index: pid.Index},
 		Share:     shareData,
 		PublicKey: pubKeyBytes,
-		ChainCode: chainCode,
+		ChainCode: chainCode[:],
 	}, nil
 }
 
