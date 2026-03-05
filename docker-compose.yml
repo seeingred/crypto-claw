@@ -1,0 +1,76 @@
+services:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./scripts/docker-init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - cclaw
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # Party A - AI Server (TSS Signer)
+  # ---------------------------------------------------------------------------
+  party-a:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: party-a
+    container_name: crypto-claw-party-a
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config/party-a.json:/etc/crypto-claw/config.json:ro
+      - ./certs:/etc/crypto-claw/certs:ro
+    environment:
+      CCLAW_CONFIG_PATH: /etc/crypto-claw/config.json
+      CCLAW_PASSPHRASE: "${CCLAW_PASSPHRASE:-changeme}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - cclaw
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Party B - Secure Server (TSS Co-signer)
+  # ---------------------------------------------------------------------------
+  party-b:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: party-b
+    container_name: crypto-claw-party-b
+    ports:
+      - "9443:9443"
+    volumes:
+      - ./config/party-b.json:/etc/crypto-claw/config.json:ro
+      - ./certs:/etc/crypto-claw/certs:ro
+    environment:
+      CCLAW_CONFIG_PATH: /etc/crypto-claw/config.json
+      CCLAW_PASSPHRASE: "${CCLAW_PASSPHRASE:-changeme}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - cclaw
+    restart: unless-stopped
+
+networks:
+  cclaw:
+    driver: bridge
+
+volumes:
+  pgdata:
