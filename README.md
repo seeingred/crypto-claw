@@ -283,10 +283,10 @@ Derive a new child key for a blockchain.
 
 ### `POST /sign`
 
-Request a transaction to be signed.
+Request a transaction to be signed. The endpoint is chain-agnostic — the derivation path determines which VM adapter handles the request.
 
 ```json
-// Request
+// EVM example
 {
   "derivationPath": "m/44'/60'/0'/0/0",
   "to": ["0x..."],
@@ -296,8 +296,28 @@ Request a transaction to be signed.
   "nonce": 0
 }
 
+// Solana example
+{
+  "derivationPath": "m/44'/501'/0'/0'",
+  "to": ["Base58Address"],
+  "value": "1000000000",
+  "rpcUrl": "https://api.mainnet-beta.solana.com"
+}
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| derivationPath | yes | BIP-44 path of the signing key |
+| to | yes | Recipient address(es) |
+| value | no | Amount in smallest unit (wei, lamports) |
+| data | no | Hex calldata (EVM) or mint address (Solana SPL) |
+| chainId | no | EVM chain ID or Cosmos chain ID |
+| gasLimit, gasPrice, nonce | no | EVM-specific fields |
+| rpcUrl | no | Solana RPC URL — service fetches a fresh blockhash right before signing, avoiding expiry during Telegram approval. SSRF-protected (private IPs blocked in production) |
+
+```json
 // Response (approved)
-{ "signedTx": "<base64>", "status": "signed" }
+{ "signedTx": "0x...", "status": "signed" }
 
 // Response (escalated for review)
 { "txId": "<uuid>", "status": "pending_review" }
@@ -369,10 +389,11 @@ Check service health.
 9. If rejected (signable bytes mismatch, zero address, etc.) → Party A returns error to bot
 10. If whitelisted + autoMode → auto-approve, send notification, start TSS signing
 11. If escalated → Party B notifies user via Telegram with decoded tx details; user can Approve, Approve & Whitelist, or Reject; bot polls `GET /sign/:txId`
-12. If approved → both parties run TSS signing protocol
-13. Party A assembles the signed transaction
-14. Party A returns signed transaction to bot
-15. Bot broadcasts to the blockchain
+12. If approved → for Solana, fetch a fresh blockhash from the provided RPC URL and inject into the transaction (avoids expiry during approval delay)
+13. Both parties run TSS signing protocol
+14. Party A assembles the signed transaction
+15. Party A returns signed transaction to bot
+16. Bot broadcasts to the blockchain
 
 ## Security Model
 

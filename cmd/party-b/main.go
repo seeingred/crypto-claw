@@ -183,6 +183,18 @@ func main() {
 				Payload: respBytes,
 			}, nil
 
+		case transport.MsgSignReady:
+			var payload transport.SignReadyPayload
+			if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+				return nil, fmt.Errorf("unmarshal sign-ready: %w", err)
+			}
+			svc.HandleSignReady(payload)
+			return &transport.Message{
+				Type:    transport.MsgSignReady,
+				ID:      msg.ID,
+				Payload: []byte(`{"ok":true}`),
+			}, nil
+
 		default:
 			logger.Warn("unknown message type", "type", msg.Type)
 			return nil, nil

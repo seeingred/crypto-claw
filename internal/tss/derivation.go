@@ -201,10 +201,8 @@ func deriveEdDSA(masterShare *KeyShare, derivationPath string, indices []uint32)
 		}
 	}
 
-	// Ed25519 public key is the x-coordinate (32 bytes).
-	pubKeyBytes := make([]byte, 32)
-	xBytes := parentPubX.Bytes()
-	copy(pubKeyBytes[32-len(xBytes):], xBytes)
+	// Standard ed25519 public key: Y little-endian with sign of X in bit 255.
+	pubKeyBytes := edwardsPointToEd25519PubKey(parentPubX, parentPubY)
 
 	// Build derived save data.
 	derivedSave := save
@@ -277,6 +275,23 @@ func compressPublicKey(x, y *big.Int, curve ellipticCurve) []byte {
 	xBytes := x.Bytes()
 	copy(compressed[33-len(xBytes):], xBytes)
 	return compressed
+}
+
+// edwardsPointToEd25519PubKey converts Edwards curve point coordinates (X, Y)
+// to standard 32-byte ed25519 public key encoding: Y as little-endian with the
+// sign (low bit) of X stored in bit 255 (high bit of byte 31).
+func edwardsPointToEd25519PubKey(x, y *big.Int) []byte {
+	yBytes := y.Bytes() // big-endian
+	pubKey := make([]byte, 32)
+	// Reverse Y to little-endian
+	for i := 0; i < len(yBytes); i++ {
+		pubKey[i] = yBytes[len(yBytes)-1-i]
+	}
+	// Set the sign bit of X in the high bit of the last byte
+	if x.Bit(0) == 1 {
+		pubKey[31] |= 0x80
+	}
+	return pubKey
 }
 
 // ellipticCurve is a minimal interface for the curve operations we need.

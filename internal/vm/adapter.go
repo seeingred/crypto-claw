@@ -39,11 +39,12 @@ type TxRequest struct {
 	DerivationPath string   `json:"derivationPath"`
 
 	// Chain-specific fields
-	ChainID   string `json:"chainId,omitempty"`
-	GasLimit  uint64 `json:"gasLimit,omitempty"`
-	GasPrice  string `json:"gasPrice,omitempty"`
-	Nonce     uint64 `json:"nonce,omitempty"`
-	AutoNonce bool   `json:"autoNonce,omitempty"` // fetch nonce from chain
+	ChainID         string `json:"chainId,omitempty"`
+	GasLimit        uint64 `json:"gasLimit,omitempty"`
+	GasPrice        string `json:"gasPrice,omitempty"`
+	Nonce           uint64 `json:"nonce,omitempty"`
+	AutoNonce       bool   `json:"autoNonce,omitempty"`       // fetch nonce from chain
+	RpcURL          string `json:"rpcUrl,omitempty"` // Solana RPC URL for fetching blockhash at sign time
 }
 
 // UnsignedTx wraps a constructed unsigned transaction.

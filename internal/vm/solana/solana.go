@@ -1,9 +1,16 @@
 package solana
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"time"
 
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/programs/system"
@@ -84,7 +91,7 @@ func (a *Adapter) BuildUnsignedTx(_ context.Context, req *vm.TxRequest) (*vm.Uns
 
 	tx, err := solana.NewTransaction(
 		instructions,
-		solana.Hash{}, // placeholder blockhash; set at broadcast time
+		solana.Hash{}, // placeholder; fresh blockhash injected at sign time
 		solana.TransactionPayer(from),
 	)
 	if err != nil {
@@ -169,3 +176,129 @@ func (a *Adapter) DecodeTx(txBytes []byte) (*vm.DecodedTx, error) {
 	}
 	return decoded, nil
 }
+
+// InjectBlockhash replaces the blockhash in a serialized unsigned Solana transaction
+// and returns the updated serialized bytes.
+func InjectBlockhash(unsignedTx []byte, blockhash string) ([]byte, error) {
+	tx, err := solana.TransactionFromBytes(unsignedTx)
+	if err != nil {
+		return nil, fmt.Errorf("solana: decode tx for blockhash injection: %w", err)
+	}
+	tx.Message.RecentBlockhash = solana.MustHashFromBase58(blockhash)
+	raw, err := tx.MarshalBinary()
+	if err != nil {
+		return nil, fmt.Errorf("solana: re-serialize tx: %w", err)
+	}
+	return raw, nil
+}
+
+// FetchRecentBlockhash fetches a recent blockhash from a Solana JSON-RPC endpoint.
+// Performs SSRF validation: resolves DNS first, blocks private/reserved IP ranges.
+func FetchRecentBlockhash(ctx context.Context, rpcURL string) (string, error) {
+	if !allowLocalRPC {
+		if err := validateRPCURL(rpcURL); err != nil {
+			return "", fmt.Errorf("solana rpc: %w", err)
+		}
+	}
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"getLatestBlockhash","params":[{"commitment":"finalized"}]}`
+	req, err := http.NewRequestWithContext(ctx, "POST", rpcURL, bytes.NewReader([]byte(body)))
+	if err != nil {
+		return "", fmt.Errorf("solana rpc: create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("solana rpc: request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return "", fmt.Errorf("solana rpc: read response: %w", err)
+	}
+
+	var rpcResp struct {
+		Result struct {
+			Value struct {
+				Blockhash string `json:"blockhash"`
+			} `json:"value"`
+		} `json:"result"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(respBody, &rpcResp); err != nil {
+		return "", fmt.Errorf("solana rpc: parse response: %w", err)
+	}
+	if rpcResp.Error != nil {
+		return "", fmt.Errorf("solana rpc: %s", rpcResp.Error.Message)
+	}
+	if rpcResp.Result.Value.Blockhash == "" {
+		return "", fmt.Errorf("solana rpc: empty blockhash in response")
+	}
+	return rpcResp.Result.Value.Blockhash, nil
+}
+
+// validateRPCURL checks the URL for SSRF: resolves DNS, blocks private/reserved IPs.
+func validateRPCURL(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid URL: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("scheme must be http or https, got %q", u.Scheme)
+	}
+
+	host := u.Hostname()
+	if host == "" {
+		return fmt.Errorf("empty hostname")
+	}
+
+	// Resolve DNS to get the actual IP(s).
+	ips, err := net.LookupHost(host)
+	if err != nil {
+		return fmt.Errorf("DNS resolution failed for %q: %w", host, err)
+	}
+
+	for _, ipStr := range ips {
+		ip := net.ParseIP(ipStr)
+		if ip == nil {
+			return fmt.Errorf("invalid IP %q", ipStr)
+		}
+		if isPrivateIP(ip) {
+			return fmt.Errorf("blocked: %q resolves to private/reserved IP %s", host, ipStr)
+		}
+	}
+	return nil
+}
+
+// isPrivateIP returns true if the IP is in a private or reserved range.
+func isPrivateIP(ip net.IP) bool {
+	privateRanges := []string{
+		"127.0.0.0/8",    // loopback
+		"10.0.0.0/8",     // RFC 1918
+		"172.16.0.0/12",  // RFC 1918
+		"192.168.0.0/16", // RFC 1918
+		"169.254.0.0/16", // link-local
+		"::1/128",        // IPv6 loopback
+		"fc00::/7",       // IPv6 unique local
+		"fe80::/10",      // IPv6 link-local
+	}
+	for _, cidr := range privateRanges {
+		_, network, err := net.ParseCIDR(cidr)
+		if err != nil {
+			continue
+		}
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// allowLocalRPC controls whether local/private IPs are allowed for RPC.
+// Set via ALLOW_LOCAL_RPC=1 environment variable for dev/testing.
+var allowLocalRPC = os.Getenv("ALLOW_LOCAL_RPC") == "1"

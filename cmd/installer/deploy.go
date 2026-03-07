@@ -287,6 +287,7 @@ func DeployLocal(state *WizardState, logFn func(string)) error {
 	partyBDir := filepath.Join(baseDir, "party-b")
 	cmdB := exec.Command("go", "run", "./cmd/party-b", "-config", filepath.Join(partyBDir, "config.json"))
 	cmdB.Dir = findProjectRoot()
+	cmdB.Env = append(os.Environ(), "ALLOW_LOCAL_RPC=1")
 	cmdB.Stdout = os.Stdout
 	cmdB.Stderr = os.Stderr
 	if err := cmdB.Start(); err != nil {
@@ -300,6 +301,7 @@ func DeployLocal(state *WizardState, logFn func(string)) error {
 	partyADir := filepath.Join(baseDir, "party-a")
 	cmdA := exec.Command("go", "run", "./cmd/party-a", "-config", filepath.Join(partyADir, "config.json"))
 	cmdA.Dir = findProjectRoot()
+	cmdA.Env = append(os.Environ(), "ALLOW_LOCAL_RPC=1")
 	cmdA.Stdout = os.Stdout
 	cmdA.Stderr = os.Stderr
 	if err := cmdA.Start(); err != nil {
@@ -373,6 +375,7 @@ func UpdateLocal(logFn func(string)) error {
 	partyBDir := filepath.Join(baseDir, "party-b")
 	cmdB := exec.Command("go", "run", "./cmd/party-b", "-config", filepath.Join(partyBDir, "config.json"))
 	cmdB.Dir = findProjectRoot()
+	cmdB.Env = append(os.Environ(), "ALLOW_LOCAL_RPC=1")
 	cmdB.Stdout = os.Stdout
 	cmdB.Stderr = os.Stderr
 	if err := cmdB.Start(); err != nil {
@@ -387,6 +390,7 @@ func UpdateLocal(logFn func(string)) error {
 	partyADir := filepath.Join(baseDir, "party-a")
 	cmdA := exec.Command("go", "run", "./cmd/party-a", "-config", filepath.Join(partyADir, "config.json"))
 	cmdA.Dir = findProjectRoot()
+	cmdA.Env = append(os.Environ(), "ALLOW_LOCAL_RPC=1")
 	cmdA.Stdout = os.Stdout
 	cmdA.Stderr = os.Stderr
 	if err := cmdA.Start(); err != nil {

@@ -339,11 +339,9 @@ func marshalEdDSAKeyShare(pid *tss.PartyID, save *edkeygen.LocalPartySaveData) (
 		return nil, ErrDKGFailed.WithCause(fmt.Errorf("marshal save data: %w", err))
 	}
 
-	// Extract EdDSA public key (32 bytes).
+	// Extract EdDSA public key: standard ed25519 encoding (Y little-endian + sign of X).
 	pubKey := save.EDDSAPub
-	pubKeyBytes := make([]byte, 32)
-	xBytes := pubKey.X().Bytes()
-	copy(pubKeyBytes[32-len(xBytes):], xBytes)
+	pubKeyBytes := edwardsPointToEd25519PubKey(pubKey.X(), pubKey.Y())
 
 	chainCode := sha256.Sum256(pubKeyBytes)
 

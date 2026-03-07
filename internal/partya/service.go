@@ -13,6 +13,7 @@ import (
 	"github.com/seeingred/crypto-claw/internal/transport"
 	"github.com/seeingred/crypto-claw/internal/tss"
 	"github.com/seeingred/crypto-claw/internal/vm"
+	solanarpc "github.com/seeingred/crypto-claw/internal/vm/solana"
 )
 
 // TransportClient abstracts the Party A -> Party B communication.
@@ -119,14 +120,15 @@ func (s *Service) Derive(ctx context.Context, derivationPath, label string) (*De
 
 // SignRequest holds the parameters for a sign request.
 type SignRequest struct {
-	DerivationPath string `json:"derivationPath"`
-	To             []string `json:"to"`
-	Value          string `json:"value,omitempty"`
-	Data           []byte `json:"data,omitempty"`
-	ChainID        string `json:"chainId,omitempty"`
-	GasLimit       uint64 `json:"gasLimit,omitempty"`
-	GasPrice       string `json:"gasPrice,omitempty"`
-	Nonce          uint64 `json:"nonce,omitempty"`
+	DerivationPath  string   `json:"derivationPath"`
+	To              []string `json:"to"`
+	Value           string   `json:"value,omitempty"`
+	Data            []byte   `json:"data,omitempty"`
+	ChainID         string   `json:"chainId,omitempty"`
+	GasLimit        uint64   `json:"gasLimit,omitempty"`
+	GasPrice        string   `json:"gasPrice,omitempty"`
+	Nonce           uint64   `json:"nonce,omitempty"`
+	RpcURL          string   `json:"rpcUrl,omitempty"`
 }
 
 // SignResult holds the result of a sign request.
@@ -152,15 +154,16 @@ func (s *Service) Sign(ctx context.Context, req *SignRequest) (*SignResult, erro
 
 	// Build the unsigned transaction
 	txReq := &vm.TxRequest{
-		From:           derivedKey.Address,
-		To:             req.To,
-		Value:          req.Value,
-		Data:           req.Data,
-		DerivationPath: req.DerivationPath,
-		ChainID:        req.ChainID,
-		GasLimit:       req.GasLimit,
-		GasPrice:       req.GasPrice,
-		Nonce:          req.Nonce,
+		From:            derivedKey.Address,
+		To:              req.To,
+		Value:           req.Value,
+		Data:            req.Data,
+		DerivationPath:  req.DerivationPath,
+		ChainID:         req.ChainID,
+		GasLimit:        req.GasLimit,
+		GasPrice:        req.GasPrice,
+		Nonce:           req.Nonce,
+		RpcURL:          req.RpcURL,
 	}
 	unsignedTx, err := adapter.BuildUnsignedTx(ctx, txReq)
 	if err != nil {
@@ -204,7 +207,7 @@ func (s *Service) Sign(ctx context.Context, req *SignRequest) (*SignResult, erro
 	switch signResp.Decision {
 	case "approve":
 		// Party B approved — run TSS signing (Party B is also running its side).
-		signedTx, err := s.runTSSSigning(ctx, adapter, derivedKey, unsignedTx)
+		signedTx, err := s.runTSSSigning(ctx, adapter, derivedKey, unsignedTx, req.RpcURL, signResp.TxID)
 		if err != nil {
 			return nil, fmt.Errorf("TSS signing: %w", err)
 		}
@@ -224,7 +227,7 @@ func (s *Service) Sign(ctx context.Context, req *SignRequest) (*SignResult, erro
 	case "escalate":
 		// Store as pending for human review
 		txID := signResp.TxID
-		s.escalation.Add(txID, signResp.Reason, unsignedTx.RawBytes)
+		s.escalation.Add(txID, signResp.Reason, unsignedTx.RawBytes, req.RpcURL)
 
 		// Persist to store
 		txRecord := &store.TxRecord{
@@ -254,10 +257,38 @@ func (s *Service) Sign(ctx context.Context, req *SignRequest) (*SignResult, erro
 }
 
 // runTSSSigning executes the TSS signing protocol with Party B and assembles the signed tx.
-func (s *Service) runTSSSigning(ctx context.Context, adapter vm.Adapter, derivedKey *store.DerivedKeyRecord, unsignedTx *vm.UnsignedTx) ([]byte, error) {
+// For Solana transactions, if rpcURL is set, a fresh blockhash is fetched and injected
+// into the transaction right before signing to avoid blockhash expiry.
+func (s *Service) runTSSSigning(ctx context.Context, adapter vm.Adapter, derivedKey *store.DerivedKeyRecord, unsignedTx *vm.UnsignedTx, rpcURL string, txID string) ([]byte, error) {
+	// For Solana: fetch fresh blockhash and inject before signing.
+	if rpcURL != "" && adapter.Name() == "solana" {
+		blockhash, err := solanarpc.FetchRecentBlockhash(ctx, rpcURL)
+		if err != nil {
+			return nil, fmt.Errorf("fetch recent blockhash: %w", err)
+		}
+		updated, err := solanarpc.InjectBlockhash(unsignedTx.RawBytes, blockhash)
+		if err != nil {
+			return nil, fmt.Errorf("inject blockhash: %w", err)
+		}
+		unsignedTx.RawBytes = updated
+	}
+
 	signableBytes, err := adapter.ExtractSignableBytes(unsignedTx.RawBytes)
 	if err != nil {
 		return nil, fmt.Errorf("extract signable bytes: %w", err)
+	}
+
+	// Send final signable bytes to Party B so both parties sign the same message.
+	readyPayload, _ := json.Marshal(transport.SignReadyPayload{
+		TxID:          txID,
+		SignableBytes: base64.StdEncoding.EncodeToString(signableBytes),
+	})
+	if _, err := s.transport.SendAndReceive(ctx, &transport.Message{
+		Type:    transport.MsgSignReady,
+		ID:      s.nextMsgID(),
+		Payload: readyPayload,
+	}); err != nil {
+		return nil, fmt.Errorf("send sign-ready to Party B: %w", err)
 	}
 
 	signReq := tss.SignRequest{
@@ -310,7 +341,8 @@ func (s *Service) HandleSignApproved(ctx context.Context, txID, derivationPath s
 	unsignedTx := &vm.UnsignedTx{RawBytes: pending.UnsignedTx}
 
 	// Run TSS signing (Party B is also running its side).
-	signedTx, err := s.runTSSSigning(ctx, adapter, derivedKey, unsignedTx)
+	// For Solana, pending.RpcURL is used to fetch a fresh blockhash.
+	signedTx, err := s.runTSSSigning(ctx, adapter, derivedKey, unsignedTx, pending.RpcURL, txID)
 	if err != nil {
 		s.escalation.Update(txID, store.TxStatusRejected, nil)
 		return

@@ -54,6 +54,10 @@ type Service struct {
 	// Active TSS signing router (one signing session at a time).
 	activeRouter   *transport.ServerRouter
 	activeRouterMu sync.Mutex
+
+	// Channels for receiving final signable bytes from Party A (MsgSignReady).
+	signReady   map[string]chan []byte
+	signReadyMu sync.Mutex
 }
 
 // signContext holds the context for an in-flight sign request.
@@ -73,8 +77,9 @@ func New(cfg *config.Config, st store.Store, proto tss.Protocol, vmReg *vm.Regis
 		vmReg:    vmReg,
 		analyzer: a,
 		logger:   logger,
-		pending:  make(map[string]chan bool),
-		reqCache: make(map[string]*signContext),
+		pending:   make(map[string]chan bool),
+		reqCache:  make(map[string]*signContext),
+		signReady: make(map[string]chan []byte),
 	}
 
 	if cfg.Telegram.BotToken != "" {
@@ -198,6 +203,7 @@ func (s *Service) HandleSignRequest(ctx context.Context, msgID uint64, req trans
 
 		return transport.SignResponsePayload{
 			Decision: string(analyzer.ActionApprove),
+			TxID:     txID,
 			Reason:   result.Decision.Reason,
 		}
 	}
@@ -228,7 +234,7 @@ func (s *Service) startSigning(txID string, req transport.SignRequestPayload) {
 			s.activeRouterMu.Unlock()
 		}()
 
-		sig, err := s.sign(context.Background(), req, router)
+		sig, err := s.sign(context.Background(), txID, req, router)
 		if err != nil {
 			s.logger.Error("TSS signing failed", "txID", txID, "err", err)
 			s.updateTxStatus(context.Background(), txID, store.TxStatusRejected)
@@ -318,11 +324,46 @@ func (s *Service) escalate(ctx context.Context, txID string, req transport.SignR
 	}
 }
 
+// HandleSignReady is called when Party A sends MsgSignReady with final signable bytes.
+func (s *Service) HandleSignReady(payload transport.SignReadyPayload) {
+	s.signReadyMu.Lock()
+	ch, ok := s.signReady[payload.TxID]
+	s.signReadyMu.Unlock()
+
+	if ok {
+		decoded, err := base64.StdEncoding.DecodeString(payload.SignableBytes)
+		if err != nil {
+			s.logger.Error("failed to decode sign-ready bytes", "txID", payload.TxID, "err", err)
+			return
+		}
+		ch <- decoded
+	}
+}
+
 // sign performs the TSS signing operation using the provided router.
-func (s *Service) sign(ctx context.Context, req transport.SignRequestPayload, router tss.MessageRouter) (*tss.Signature, error) {
-	msgBytes, err := base64.StdEncoding.DecodeString(req.SignableBytes)
-	if err != nil {
-		return nil, fmt.Errorf("decode signable bytes: %w", err)
+func (s *Service) sign(ctx context.Context, txID string, req transport.SignRequestPayload, router tss.MessageRouter) (*tss.Signature, error) {
+	// Wait for Party A to send final signable bytes (MsgSignReady).
+	// This ensures both parties sign the same message, even if Party A
+	// modified the transaction (e.g., injected a fresh Solana blockhash).
+	ch := make(chan []byte, 1)
+	s.signReadyMu.Lock()
+	s.signReady[txID] = ch
+	s.signReadyMu.Unlock()
+
+	defer func() {
+		s.signReadyMu.Lock()
+		delete(s.signReady, txID)
+		s.signReadyMu.Unlock()
+	}()
+
+	var msgBytes []byte
+	select {
+	case msgBytes = <-ch:
+		// Got final signable bytes from Party A.
+	case <-time.After(30 * time.Second):
+		return nil, fmt.Errorf("timeout waiting for sign-ready from Party A")
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 
 	derivedKey, err := s.store.GetDerivedKey(ctx, req.DerivationPath)

@@ -13,6 +13,7 @@ type PendingTx struct {
 	Reason     string         `json:"reason,omitempty"`
 	UnsignedTx []byte         `json:"-"`              // raw unsigned tx for TSS signing on approval
 	SignedTx   []byte         `json:"signedTx,omitempty"`
+	RpcURL     string         `json:"-"`              // Solana RPC URL for fetching blockhash at sign time
 }
 
 // EscalationQueue manages in-memory pending escalated transactions.
@@ -29,7 +30,7 @@ func NewEscalationQueue() *EscalationQueue {
 }
 
 // Add adds a new pending transaction to the queue.
-func (q *EscalationQueue) Add(txID, reason string, unsignedTx []byte) {
+func (q *EscalationQueue) Add(txID, reason string, unsignedTx []byte, rpcURL string) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.pending[txID] = &PendingTx{
@@ -37,6 +38,7 @@ func (q *EscalationQueue) Add(txID, reason string, unsignedTx []byte) {
 		Status:     store.TxStatusPending,
 		Reason:     reason,
 		UnsignedTx: unsignedTx,
+		RpcURL:     rpcURL,
 	}
 }
 

@@ -23,6 +23,7 @@ const (
 	MsgTxStatusReq  MessageType = 0x14 // Transaction status query
 	MsgTxStatusResp MessageType = 0x15 // Transaction status response
 	MsgSignApproved MessageType = 0x16 // Async escalation approved (Party B → Party A)
+	MsgSignReady    MessageType = 0x17 // Party A → Party B: final signable bytes before TSS signing
 	MsgHealthCheck  MessageType = 0x20 // Health check ping
 	MsgHealthResp   MessageType = 0x21 // Health check response
 )
@@ -110,6 +111,14 @@ type SignResponsePayload struct {
 type SignApprovedPayload struct {
 	TxID           string `json:"txId"`
 	DerivationPath string `json:"derivationPath"`
+}
+
+// SignReadyPayload is sent by Party A to Party B with final signable bytes
+// right before TSS signing starts. This allows Party A to inject chain-specific
+// data (e.g., Solana blockhash) after approval but before signing.
+type SignReadyPayload struct {
+	TxID          string `json:"txId"`
+	SignableBytes string `json:"signableBytes"` // base64 final bytes to sign
 }
 
 // TxStatusResponsePayload is the JSON payload for MsgTxStatusResp.

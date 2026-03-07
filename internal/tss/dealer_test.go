@@ -124,9 +124,7 @@ func TestDealerSetupEdDSA(t *testing.T) {
 
 	// Compute public key point.
 	x, y := curve.ScalarBaseMult(scalar.Bytes())
-	pubKeyBytes := make([]byte, 32)
-	xBytes := x.Bytes()
-	copy(pubKeyBytes[32-len(xBytes):], xBytes)
+	pubKeyBytes := edwardsPointToEd25519PubKey(x, y)
 
 	chainCode := make([]byte, 32)
 	chainCode[0] = 0xAA

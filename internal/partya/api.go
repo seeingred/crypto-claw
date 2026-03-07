@@ -58,14 +58,15 @@ func (h *apiHandler) handleDerive(w http.ResponseWriter, r *http.Request) {
 }
 
 type signAPIRequest struct {
-	DerivationPath string   `json:"derivationPath"`
-	To             []string `json:"to"`
-	Value          string   `json:"value,omitempty"`
-	Data           string   `json:"data,omitempty"` // hex-encoded
-	ChainID        string   `json:"chainId,omitempty"`
-	GasLimit       uint64   `json:"gasLimit,omitempty"`
-	GasPrice       string   `json:"gasPrice,omitempty"`
-	Nonce          uint64   `json:"nonce,omitempty"`
+	DerivationPath  string   `json:"derivationPath"`
+	To              []string `json:"to"`
+	Value           string   `json:"value,omitempty"`
+	Data            string   `json:"data,omitempty"` // hex-encoded
+	ChainID         string   `json:"chainId,omitempty"`
+	GasLimit        uint64   `json:"gasLimit,omitempty"`
+	GasPrice        string   `json:"gasPrice,omitempty"`
+	Nonce           uint64   `json:"nonce,omitempty"`
+	RpcURL          string   `json:"rpcUrl,omitempty"` // Solana RPC URL for fetching blockhash at sign time
 }
 
 func (h *apiHandler) handleSign(w http.ResponseWriter, r *http.Request) {
@@ -95,14 +96,15 @@ func (h *apiHandler) handleSign(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result, err := h.svc.Sign(r.Context(), &SignRequest{
-		DerivationPath: req.DerivationPath,
-		To:             req.To,
-		Value:          req.Value,
-		Data:           data,
-		ChainID:        req.ChainID,
-		GasLimit:       req.GasLimit,
-		GasPrice:       req.GasPrice,
-		Nonce:          req.Nonce,
+		DerivationPath:  req.DerivationPath,
+		To:              req.To,
+		Value:           req.Value,
+		Data:            data,
+		ChainID:         req.ChainID,
+		GasLimit:        req.GasLimit,
+		GasPrice:        req.GasPrice,
+		Nonce:           req.Nonce,
+		RpcURL:          req.RpcURL,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -297,6 +299,7 @@ are chain-specific and ignored by adapters that don't use them.
 | gasLimit | number | no | EVM gas limit |
 | gasPrice | string | no | EVM gas price in wei |
 | nonce | number | no | EVM transaction nonce |
+| rpcUrl | string | no | Solana RPC endpoint URL. The service fetches a fresh blockhash right before signing. **Required for Solana** |
 
 **EVM example** (ETH transfer):
 ` + "```json" + `
@@ -316,7 +319,8 @@ are chain-specific and ignored by adapters that don't use them.
 {
   "derivationPath": "m/44'/501'/0'/0'",
   "to": ["RecipientBase58Address"],
-  "value": "1000000000"
+  "value": "1000000000",
+  "rpcUrl": "https://api.mainnet-beta.solana.com"
 }
 ` + "```" + `
 
@@ -331,8 +335,8 @@ are chain-specific and ignored by adapters that don't use them.
 ` + "```" + `
 
 **Notes:**
-- Solana: the recent blockhash is set to a placeholder. The bot should fetch
-  the latest blockhash from Solana RPC and inject it before broadcasting.
+- Solana: pass rpcUrl so the service fetches a fresh blockhash right before signing.
+  This avoids blockhash expiry during Telegram approval flow (~60-90s validity).
 - Solana SPL: pass the mint address as hex in the data field.
 - EVM: if gasLimit/gasPrice/nonce are omitted, defaults are used. For production,
   fetch these from the chain RPC before signing.
