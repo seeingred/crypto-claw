@@ -607,6 +607,7 @@ func buildPartyConfig(state *WizardState, party string, certDir string) *config.
 		// Party B listens for connections.
 		cfg.Transport.ListenAddr = "0.0.0.0:9000"
 		cfg.Analyzer = config.AnalyzerConfig{
+			DisableAI: state.DisableAI,
 			LLM: config.LLMConfig{
 				Provider: state.LLMProvider,
 				APIKey:   state.LLMAPIKey,

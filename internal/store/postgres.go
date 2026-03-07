@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -91,6 +92,12 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 
 		CREATE INDEX IF NOT EXISTS idx_transactions_status ON transactions(status);
 		CREATE INDEX IF NOT EXISTS idx_transactions_derivation_path ON transactions(derivation_path);
+
+		CREATE TABLE IF NOT EXISTS whitelist (
+			address    TEXT PRIMARY KEY,
+			label      TEXT NOT NULL DEFAULT '',
+			added_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
 	`
 	_, err := s.pool.Exec(ctx, schema)
 	return err
@@ -407,6 +414,60 @@ func (s *PostgresStore) DeleteTx(ctx context.Context, txID string) error {
 func (s *PostgresStore) ClearDerivedKeys(ctx context.Context) error {
 	_, err := s.pool.Exec(ctx, `DELETE FROM derived_keys`)
 	return err
+}
+
+// AddWhitelistEntry adds an address to the whitelist.
+func (s *PostgresStore) AddWhitelistEntry(ctx context.Context, entry *WhitelistEntry) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO whitelist (address, label, added_at)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (address) DO UPDATE SET label = EXCLUDED.label
+	`, strings.ToLower(entry.Address), entry.Label, entry.AddedAt)
+	return err
+}
+
+// RemoveWhitelistEntry removes an address from the whitelist.
+func (s *PostgresStore) RemoveWhitelistEntry(ctx context.Context, address string) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM whitelist WHERE address = $1`, strings.ToLower(address))
+	return err
+}
+
+// IsWhitelisted checks if an address is in the whitelist.
+func (s *PostgresStore) IsWhitelisted(ctx context.Context, address string) (bool, error) {
+	var exists bool
+	err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM whitelist WHERE address = $1)`,
+		strings.ToLower(address)).Scan(&exists)
+	return exists, err
+}
+
+// GetWhitelistEntry returns a whitelist entry by address.
+func (s *PostgresStore) GetWhitelistEntry(ctx context.Context, address string) (*WhitelistEntry, error) {
+	var entry WhitelistEntry
+	err := s.pool.QueryRow(ctx, `SELECT address, label, added_at FROM whitelist WHERE address = $1`,
+		strings.ToLower(address)).Scan(&entry.Address, &entry.Label, &entry.AddedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &entry, nil
+}
+
+// ListWhitelist returns all whitelisted addresses.
+func (s *PostgresStore) ListWhitelist(ctx context.Context) ([]*WhitelistEntry, error) {
+	rows, err := s.pool.Query(ctx, `SELECT address, label, added_at FROM whitelist ORDER BY added_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var entries []*WhitelistEntry
+	for rows.Next() {
+		var e WhitelistEntry
+		if err := rows.Scan(&e.Address, &e.Label, &e.AddedAt); err != nil {
+			return nil, err
+		}
+		entries = append(entries, &e)
+	}
+	return entries, rows.Err()
 }
 
 // Close closes the database connection pool.

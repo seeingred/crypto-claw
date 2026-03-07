@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/seeingred/crypto-claw/internal/store"
 	"github.com/seeingred/crypto-claw/internal/transport"
 	"github.com/seeingred/crypto-claw/internal/tss"
+	"github.com/seeingred/crypto-claw/internal/vm"
 )
 
 // SigningStartedCallback is called when Party B starts TSS signing (approve or escalation-approve).
@@ -32,6 +34,7 @@ type Service struct {
 	cfg       *config.Config
 	store     store.Store
 	tss       tss.Protocol
+	vmReg     *vm.Registry
 	analyzer  *analyzer.Analyzer
 	bot       *telegram.Bot
 	logger    *slog.Logger
@@ -55,17 +58,19 @@ type Service struct {
 
 // signContext holds the context for an in-flight sign request.
 type signContext struct {
-	req transport.SignRequestPayload
+	req    transport.SignRequestPayload
+	result *analyzer.AnalysisResult
 }
 
 // New creates a new Party B service.
-func New(cfg *config.Config, st store.Store, proto tss.Protocol, logger *slog.Logger) (*Service, error) {
-	a := analyzer.New(cfg.Analyzer, logger)
+func New(cfg *config.Config, st store.Store, proto tss.Protocol, vmReg *vm.Registry, logger *slog.Logger) (*Service, error) {
+	a := analyzer.New(cfg.Analyzer, vmReg, st, logger)
 
 	svc := &Service{
 		cfg:      cfg,
 		store:    st,
 		tss:      proto,
+		vmReg:    vmReg,
 		analyzer: a,
 		logger:   logger,
 		pending:  make(map[string]chan bool),
@@ -79,7 +84,20 @@ func New(cfg *config.Config, st store.Store, proto tss.Protocol, logger *slog.Lo
 		}
 		bot.SetAutoMode(cfg.Analyzer.AutoMode)
 		bot.SetDecisionCallback(svc.onTelegramDecision)
+		bot.SetWhitelistCallback(svc.onTelegramWhitelist)
 		svc.bot = bot
+	}
+
+	// Seed whitelist from config.
+	for _, seed := range cfg.Analyzer.Whitelist {
+		entry := &store.WhitelistEntry{
+			Address: strings.ToLower(seed.Address),
+			Label:   seed.Label,
+			AddedAt: time.Now(),
+		}
+		if err := st.AddWhitelistEntry(context.Background(), entry); err != nil {
+			logger.Warn("failed to seed whitelist entry", "address", seed.Address, "err", err)
+		}
 	}
 
 	return svc, nil
@@ -123,7 +141,7 @@ func (s *Service) HandleTSSRound(from tss.PartyID, payload []byte) {
 }
 
 // HandleSignRequest is the main entry point for incoming sign requests.
-// It runs the analyzer, returns the decision, and starts TSS signing if approved.
+// It runs the analyzer, routes the decision, and starts TSS signing if approved.
 func (s *Service) HandleSignRequest(ctx context.Context, msgID uint64, req transport.SignRequestPayload) transport.SignResponsePayload {
 	txID := uuid.New().String()
 	s.logger.Info("received sign request", "txID", txID, "to", req.To, "path", req.DerivationPath)
@@ -146,36 +164,47 @@ func (s *Service) HandleSignRequest(ctx context.Context, msgID uint64, req trans
 		s.logger.Error("failed to save tx", "err", err)
 	}
 
-	// Analyze the transaction.
-	decision := s.analyzer.Analyze(ctx, req)
-	s.logger.Info("analyzer decision", "txID", txID, "action", decision.Action, "confidence", decision.Confidence, "reason", decision.Reason)
+	// Run the analyzer (decodes tx, verifies signable bytes, checks whitelist, optionally LLM).
+	result := s.analyzer.Analyze(ctx, req)
+	s.logger.Info("analyzer result",
+		"txID", txID,
+		"action", result.Decision.Action,
+		"confidence", result.Decision.Confidence,
+		"whitelisted", result.Whitelisted,
+		"signableBytesOK", result.SignableBytesOK,
+		"reason", result.Decision.Reason,
+	)
 
-	// Determine action.
-	shouldEscalate := decision.Action == analyzer.ActionEscalate || (s.bot != nil && !s.bot.AutoMode())
-	if s.bot != nil && s.bot.AutoMode() && decision.Action != analyzer.ActionEscalate {
-		shouldEscalate = false
-	}
+	// --- Decision routing ---
 
-	if shouldEscalate {
-		return s.escalate(ctx, txID, req, decision.Reason)
-	}
-
-	if decision.Action == analyzer.ActionReject {
+	// Hard reject: signable bytes mismatch or analyzer rejects.
+	if result.Decision.Action == analyzer.ActionReject {
 		s.updateTxStatus(ctx, txID, store.TxStatusRejected)
 		return transport.SignResponsePayload{
 			Decision: string(analyzer.ActionReject),
-			Reason:   decision.Reason,
+			Reason:   result.Decision.Reason,
 		}
 	}
 
-	// Approved — start TSS signing in background (Party A will also start after receiving "approve").
-	s.updateTxStatus(ctx, txID, store.TxStatusApproved)
-	s.startSigning(txID, req)
+	// autoMode=true: whitelisted addresses auto-approve with notification.
+	if s.bot != nil && s.bot.AutoMode() && result.Whitelisted {
+		s.updateTxStatus(ctx, txID, store.TxStatusApproved)
+		s.startSigning(txID, req)
 
-	return transport.SignResponsePayload{
-		Decision: string(analyzer.ActionApprove),
-		Reason:   decision.Reason,
+		// Send notification (non-interactive) to user about auto-approved tx.
+		if err := s.bot.NotifyAutoApproved(txID, result); err != nil {
+			s.logger.Warn("failed to send auto-approve notification", "err", err)
+		}
+
+		return transport.SignResponsePayload{
+			Decision: string(analyzer.ActionApprove),
+			Reason:   result.Decision.Reason,
+		}
 	}
+
+	// autoMode=true, not whitelisted: escalate everything to user.
+	// autoMode=false: escalate everything to user.
+	return s.escalate(ctx, txID, req, result)
 }
 
 // startSigning begins the TSS signing protocol for Party B in a background goroutine.
@@ -215,9 +244,9 @@ func (s *Service) startSigning(txID string, req transport.SignRequestPayload) {
 }
 
 // escalate sends a notification to Telegram and returns immediately with "escalate" status.
-func (s *Service) escalate(ctx context.Context, txID string, req transport.SignRequestPayload, reason string) transport.SignResponsePayload {
+func (s *Service) escalate(ctx context.Context, txID string, req transport.SignRequestPayload, result *analyzer.AnalysisResult) transport.SignResponsePayload {
 	if s.bot != nil {
-		if err := s.bot.NotifyTransaction(txID, req, reason); err != nil {
+		if err := s.bot.NotifyForReview(txID, result); err != nil {
 			s.logger.Error("failed to send telegram notification", "err", err)
 			s.updateTxStatus(ctx, txID, store.TxStatusRejected)
 			return transport.SignResponsePayload{
@@ -240,7 +269,7 @@ func (s *Service) escalate(ctx context.Context, txID string, req transport.SignR
 	s.pendingMu.Unlock()
 
 	s.reqCacheMu.Lock()
-	s.reqCache[txID] = &signContext{req: req}
+	s.reqCache[txID] = &signContext{req: req, result: result}
 	s.reqCacheMu.Unlock()
 
 	// Handle the decision asynchronously.
@@ -285,14 +314,12 @@ func (s *Service) escalate(ctx context.Context, txID string, req transport.SignR
 	return transport.SignResponsePayload{
 		Decision: string(analyzer.ActionEscalate),
 		TxID:     txID,
-		Reason:   reason,
+		Reason:   result.Decision.Reason,
 	}
 }
 
 // sign performs the TSS signing operation using the provided router.
 func (s *Service) sign(ctx context.Context, req transport.SignRequestPayload, router tss.MessageRouter) (*tss.Signature, error) {
-	// Use the pre-computed signable bytes (hash) that Party A extracted.
-	// Both parties MUST sign the same bytes for TSS to produce a valid signature.
 	msgBytes, err := base64.StdEncoding.DecodeString(req.SignableBytes)
 	if err != nil {
 		return nil, fmt.Errorf("decode signable bytes: %w", err)
@@ -331,6 +358,37 @@ func (s *Service) onTelegramDecision(txID string, approved bool) {
 	}
 }
 
+// onTelegramWhitelist is the callback when user clicks "Approve & Whitelist".
+func (s *Service) onTelegramWhitelist(txID string) {
+	s.reqCacheMu.Lock()
+	sc, ok := s.reqCache[txID]
+	s.reqCacheMu.Unlock()
+
+	if !ok {
+		s.logger.Warn("whitelist request for unknown tx", "txID", txID)
+		return
+	}
+
+	// Use decoded tx addresses if available, otherwise claimed.
+	addrs := sc.req.To
+	if sc.result != nil && sc.result.DecodedTx != nil && len(sc.result.DecodedTx.To) > 0 {
+		addrs = sc.result.DecodedTx.To
+	}
+
+	for _, addr := range addrs {
+		entry := &store.WhitelistEntry{
+			Address: strings.ToLower(addr),
+			Label:   "approved via Telegram",
+			AddedAt: time.Now(),
+		}
+		if err := s.store.AddWhitelistEntry(context.Background(), entry); err != nil {
+			s.logger.Error("failed to whitelist address", "address", addr, "err", err)
+		} else {
+			s.logger.Info("address whitelisted via Telegram", "address", addr, "txID", txID)
+		}
+	}
+}
+
 // GetTxStatus returns the current status of a transaction.
 func (s *Service) GetTxStatus(ctx context.Context, txID string) (*store.TxRecord, error) {
 	return s.store.GetTx(ctx, txID)
@@ -338,9 +396,12 @@ func (s *Service) GetTxStatus(ctx context.Context, txID string) (*store.TxRecord
 
 // HandleDeriveRequest derives a child key share and stores it locally.
 func (s *Service) HandleDeriveRequest(ctx context.Context, derivationPath string) error {
+	// Determine curve from the VM adapter registry.
 	curve := tss.CurveSecp256k1
-	if isSolanePath(derivationPath) {
-		curve = tss.CurveEd25519
+	if s.vmReg != nil {
+		if adapter, ok := s.vmReg.ForPath(derivationPath); ok {
+			curve = adapter.Curve()
+		}
 	}
 
 	masterShare, err := s.store.GetMasterShare(ctx, curve)
@@ -356,9 +417,9 @@ func (s *Service) HandleDeriveRequest(ctx context.Context, derivationPath string
 	record := &store.DerivedKeyRecord{
 		DerivationPath: derivationPath,
 		Curve:          curve,
-		PublicKey:       derived.PublicKey,
-		Share:           derived.Share,
-		CreatedAt:       time.Now(),
+		PublicKey:      derived.PublicKey,
+		Share:          derived.Share,
+		CreatedAt:      time.Now(),
 	}
 	if err := s.store.SaveDerivedKey(ctx, record); err != nil {
 		return fmt.Errorf("save derived key: %w", err)
@@ -366,10 +427,6 @@ func (s *Service) HandleDeriveRequest(ctx context.Context, derivationPath string
 
 	s.logger.Info("derived key for path", "path", derivationPath, "curve", curve)
 	return nil
-}
-
-func isSolanePath(path string) bool {
-	return len(path) > 7 && (path[5:8] == "501" || (len(path) > 8 && path[5:9] == "501'"))
 }
 
 func (s *Service) updateTxStatus(ctx context.Context, txID string, status store.TxStatus) {

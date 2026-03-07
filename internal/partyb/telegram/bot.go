@@ -7,13 +7,16 @@ import (
 	"sync"
 
 	"github.com/seeingred/crypto-claw/internal/config"
-	"github.com/seeingred/crypto-claw/internal/transport"
+	"github.com/seeingred/crypto-claw/internal/partyb/analyzer"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
 // DecisionCallback is called when the user approves or rejects a transaction.
 type DecisionCallback func(txID string, approved bool)
+
+// WhitelistCallback is called when the user approves AND whitelists the address.
+type WhitelistCallback func(txID string)
 
 // Bot wraps a Telegram bot for transaction notifications and approval.
 type Bot struct {
@@ -22,6 +25,7 @@ type Bot struct {
 	autoMode         bool
 	mu               sync.RWMutex
 	onDecision       DecisionCallback
+	onWhitelist      WhitelistCallback
 	logger           *slog.Logger
 	stopCh           chan struct{}
 }
@@ -46,6 +50,11 @@ func New(cfg config.TelegramConfig, logger *slog.Logger) (*Bot, error) {
 // SetDecisionCallback sets the callback invoked on user approval/rejection.
 func (b *Bot) SetDecisionCallback(cb DecisionCallback) {
 	b.onDecision = cb
+}
+
+// SetWhitelistCallback sets the callback invoked when user approves & whitelists.
+func (b *Bot) SetWhitelistCallback(cb WhitelistCallback) {
+	b.onWhitelist = cb
 }
 
 // SetAutoMode toggles auto/manual mode.
@@ -89,18 +98,30 @@ func (b *Bot) Stop() {
 	b.api.StopReceivingUpdates()
 }
 
-// NotifyTransaction sends a transaction notification with Approve/Reject buttons.
-func (b *Bot) NotifyTransaction(txID string, req transport.SignRequestPayload, reason string) error {
-	text := formatTxNotification(txID, req, reason)
+// NotifyForReview sends a rich transaction notification with Approve/Whitelist/Reject buttons.
+func (b *Bot) NotifyForReview(txID string, result *analyzer.AnalysisResult) error {
+	text := formatReviewNotification(txID, result)
 
 	msg := tgbotapi.NewMessage(b.authorizedUserID, text)
 	msg.ParseMode = "Markdown"
 	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("Approve", "approve:"+txID),
+			tgbotapi.NewInlineKeyboardButtonData("Approve & Whitelist", "whitelist:"+txID),
 			tgbotapi.NewInlineKeyboardButtonData("Reject", "reject:"+txID),
 		),
 	)
+
+	_, err := b.api.Send(msg)
+	return err
+}
+
+// NotifyAutoApproved sends a non-interactive notification about an auto-approved transaction.
+func (b *Bot) NotifyAutoApproved(txID string, result *analyzer.AnalysisResult) error {
+	text := formatAutoApprovedNotification(txID, result)
+
+	msg := tgbotapi.NewMessage(b.authorizedUserID, text)
+	msg.ParseMode = "Markdown"
 
 	_, err := b.api.Send(msg)
 	return err
@@ -135,25 +156,42 @@ func (b *Bot) isAuthorized(userID int64) bool {
 	return userID == b.authorizedUserID
 }
 
-func formatTxNotification(txID string, req transport.SignRequestPayload, reason string) string {
+func formatReviewNotification(txID string, result *analyzer.AnalysisResult) string {
 	var sb strings.Builder
-	sb.WriteString("*New Transaction for Review*\n\n")
-	sb.WriteString(fmt.Sprintf("*TX ID:* `%s`\n", txID))
-	sb.WriteString(fmt.Sprintf("*To:* `%s`\n", strings.Join(req.To, ", ")))
-	if req.Value != "" {
-		sb.WriteString(fmt.Sprintf("*Value:* %s wei\n", req.Value))
-	}
-	if req.Data != "" {
-		display := req.Data
-		if len(display) > 66 {
-			display = display[:66] + "..."
+	sb.WriteString("*Transaction Review Required*\n\n")
+	sb.WriteString(fmt.Sprintf("*TX ID:* `%s`\n\n", txID))
+
+	// Decoded tx details
+	sb.WriteString("*Decoded from unsigned TX:*\n")
+	sb.WriteString(escapeMD(result.Summary))
+	sb.WriteString("\n")
+
+	// Warnings
+	if len(result.Warnings) > 0 {
+		sb.WriteString("\n*Warnings:*\n")
+		for _, w := range result.Warnings {
+			sb.WriteString(fmt.Sprintf("- %s\n", escapeMD(w)))
 		}
-		sb.WriteString(fmt.Sprintf("*Data:* `%s`\n", display))
 	}
-	sb.WriteString(fmt.Sprintf("*Path:* %s\n", req.DerivationPath))
-	if reason != "" {
-		sb.WriteString(fmt.Sprintf("\n*Analyzer:* %s\n", escapeMD(reason)))
+
+	// Analyzer verdict
+	sb.WriteString(fmt.Sprintf("\n*Verdict:* %s (confidence: %.0f%%)\n",
+		escapeMD(result.Decision.Reason),
+		result.Decision.Confidence*100))
+
+	return sb.String()
+}
+
+func formatAutoApprovedNotification(txID string, result *analyzer.AnalysisResult) string {
+	var sb strings.Builder
+	sb.WriteString("*Transaction Auto-Approved*\n\n")
+	sb.WriteString(fmt.Sprintf("*TX ID:* `%s`\n\n", txID))
+	sb.WriteString(escapeMD(result.Summary))
+
+	if result.WhitelistLabel != "" {
+		sb.WriteString(fmt.Sprintf("\nWhitelisted: %s\n", escapeMD(result.WhitelistLabel)))
 	}
+
 	return sb.String()
 }
 

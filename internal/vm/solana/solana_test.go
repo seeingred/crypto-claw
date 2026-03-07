@@ -1,8 +1,11 @@
 package solana
 
 import (
+	"context"
 	"encoding/hex"
 	"testing"
+
+	"github.com/seeingred/crypto-claw/internal/vm"
 )
 
 func TestDeriveAddress(t *testing.T) {
@@ -47,5 +50,64 @@ func TestDeriveAddressInvalidKey(t *testing.T) {
 	_, err := a.DeriveAddress([]byte{0x01, 0x02})
 	if err == nil {
 		t.Error("expected error for short key")
+	}
+}
+
+func TestBuildAndDecodeTx(t *testing.T) {
+	a := New()
+
+	// Use valid base58 Solana addresses (32 zero bytes = system program).
+	from := "11111111111111111111111111111111"
+	to := "11111111111111111111111111111112"
+
+	unsignedTx, err := a.BuildUnsignedTx(context.Background(), &vm.TxRequest{
+		From:  from,
+		To:    []string{to},
+		Value: "1000000000", // 1 SOL in lamports
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(unsignedTx.RawBytes) == 0 {
+		t.Fatal("raw bytes empty")
+	}
+	if len(unsignedTx.Hash) == 0 {
+		t.Fatal("hash empty")
+	}
+
+	decoded, err := a.DecodeTx(unsignedTx.RawBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.From == "" {
+		t.Error("decoded from is empty")
+	}
+	if len(decoded.To) == 0 {
+		t.Error("decoded to is empty")
+	}
+}
+
+func TestExtractSignableBytes(t *testing.T) {
+	a := New()
+
+	from := "11111111111111111111111111111111"
+	to := "11111111111111111111111111111112"
+
+	unsignedTx, err := a.BuildUnsignedTx(context.Background(), &vm.TxRequest{
+		From:  from,
+		To:    []string{to},
+		Value: "1000000000",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	signable, err := a.ExtractSignableBytes(unsignedTx.RawBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(signable) == 0 {
+		t.Fatal("signable bytes empty")
 	}
 }

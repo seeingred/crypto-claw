@@ -17,6 +17,10 @@ import (
 	"github.com/seeingred/crypto-claw/internal/store"
 	"github.com/seeingred/crypto-claw/internal/transport"
 	"github.com/seeingred/crypto-claw/internal/tss"
+	"github.com/seeingred/crypto-claw/internal/vm"
+	"github.com/seeingred/crypto-claw/internal/vm/evm"
+	"github.com/seeingred/crypto-claw/internal/vm/solana"
+	"github.com/seeingred/crypto-claw/internal/vm/tendermint"
 )
 
 func main() {
@@ -47,8 +51,14 @@ func main() {
 	// Initialize TSS protocol.
 	proto := tss.NewProtocol(0) // 2-of-2 threshold
 
+	// Initialize VM adapter registry (for tx decoding on Party B).
+	vmReg := vm.NewRegistry()
+	vmReg.Register([]string{"60"}, evm.New())
+	vmReg.Register([]string{"501"}, solana.New())
+	vmReg.Register([]string{"118"}, tendermint.New("", ""))
+
 	// Initialize Party B service.
-	svc, err := partyb.New(cfg, st, proto, logger)
+	svc, err := partyb.New(cfg, st, proto, vmReg, logger)
 	if err != nil {
 		log.Fatalf("failed to init Party B service: %v", err)
 	}

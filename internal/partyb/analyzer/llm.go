@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/seeingred/crypto-claw/internal/config"
-	"github.com/seeingred/crypto-claw/internal/transport"
 )
 
 // LLMClient handles LLM-based transaction analysis.
@@ -38,9 +37,9 @@ type llmClassification struct {
 	Reasoning      string  `json:"reasoning"`
 }
 
-// Analyze sends transaction context to an LLM and returns a decision.
-func (c *LLMClient) Analyze(ctx context.Context, req transport.SignRequestPayload, decoded *DecodedCall) (Decision, error) {
-	prompt := buildPrompt(req, decoded)
+// AnalyzeRich sends the full analysis context to an LLM and returns a decision.
+func (c *LLMClient) AnalyzeRich(ctx context.Context, result *AnalysisResult) (Decision, error) {
+	prompt := buildRichPrompt(result)
 
 	classification, err := c.callLLM(ctx, prompt)
 	if err != nil {
@@ -50,30 +49,41 @@ func (c *LLMClient) Analyze(ctx context.Context, req transport.SignRequestPayloa
 	return classificationToDecision(classification), nil
 }
 
-// buildPrompt constructs the analysis prompt for the LLM.
-func buildPrompt(req transport.SignRequestPayload, decoded *DecodedCall) string {
+// buildRichPrompt constructs a detailed analysis prompt using the decoded tx context.
+func buildRichPrompt(result *AnalysisResult) string {
 	var sb strings.Builder
-	sb.WriteString("Analyze this blockchain transaction for security risks.\n\n")
-	sb.WriteString("Transaction details:\n")
-	sb.WriteString(fmt.Sprintf("- To: %s\n", strings.Join(req.To, ", ")))
-	if req.Value != "" {
-		sb.WriteString(fmt.Sprintf("- Value: %s wei\n", req.Value))
-	}
-	if req.Data != "" {
-		sb.WriteString(fmt.Sprintf("- Calldata: %s\n", truncate(req.Data, 200)))
-	}
-	sb.WriteString(fmt.Sprintf("- Derivation path: %s\n", req.DerivationPath))
+	sb.WriteString("You are a blockchain transaction security analyzer for an MPC-TSS signing service.\n")
+	sb.WriteString("Analyze this transaction and determine if it is safe to co-sign.\n\n")
 
-	if decoded != nil {
-		sb.WriteString(fmt.Sprintf("\nDecoded call:\n- Method: %s\n", decoded.MethodName))
-		sb.WriteString(fmt.Sprintf("- Verified contract: %v\n", decoded.Verified))
-		for name, val := range decoded.Args {
-			sb.WriteString(fmt.Sprintf("- Arg %s: %v\n", name, val))
+	sb.WriteString("=== TRANSACTION DETAILS (decoded from raw unsigned tx) ===\n")
+	sb.WriteString(result.Summary)
+
+	if len(result.FieldMismatches) > 0 {
+		sb.WriteString("\n=== WARNINGS ===\n")
+		for _, m := range result.FieldMismatches {
+			sb.WriteString(fmt.Sprintf("- %s\n", m))
+		}
+	}
+
+	if len(result.Warnings) > 0 {
+		sb.WriteString("\n=== ADDITIONAL WARNINGS ===\n")
+		for _, w := range result.Warnings {
+			sb.WriteString(fmt.Sprintf("- %s\n", w))
 		}
 	}
 
 	sb.WriteString(`
-Respond in JSON with exactly these fields:
+=== INSTRUCTIONS ===
+Based on the decoded transaction data above, classify this transaction.
+Consider:
+- Is the destination a known protocol or an unknown address?
+- Does the function call make sense for the stated purpose?
+- Is the value reasonable?
+- Are there any signs of a malicious or phishing transaction?
+- Is the contract verified?
+- Are there field mismatches between what was claimed and what the tx actually does?
+
+Respond ONLY with this JSON (no markdown, no explanation outside the JSON):
 {
   "classification": "safe" | "suspicious" | "malicious",
   "confidence": 0.0 to 1.0,
@@ -120,7 +130,6 @@ func (c *LLMClient) callLLM(ctx context.Context, prompt string) (*llmClassificat
 		if endpoint == "" {
 			return nil, fmt.Errorf("local LLM endpoint not configured")
 		}
-		// Use OpenAI-compatible format for local models.
 		reqBody, err = json.Marshal(openAIRequest{
 			Model: c.cfg.Model,
 			Messages: []openAIMessage{
@@ -193,7 +202,6 @@ func (c *LLMClient) parseResponse(body []byte) (*llmClassification, error) {
 		content = resp.Content[0].Text
 	}
 
-	// Extract JSON from potential markdown code blocks.
 	content = extractJSON(content)
 
 	var classification llmClassification

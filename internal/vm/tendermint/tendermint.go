@@ -2,6 +2,8 @@ package tendermint
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 
@@ -96,28 +98,30 @@ func (a *Adapter) BuildUnsignedTx(_ context.Context, req *vm.TxRequest) (*vm.Uns
 		return nil, fmt.Errorf("tendermint: marshal tx: %w", err)
 	}
 
-	// Cosmos SDK sign bytes are the JSON-sorted canonical encoding
+	// Cosmos SDK sign bytes are the JSON-sorted canonical encoding.
+	// ECDSA signs a 32-byte hash, so we sha256 the canonical sign bytes.
 	signBytes, err := sdk.SortJSON(rawBytes)
 	if err != nil {
-		// Fallback to raw bytes
 		signBytes = rawBytes
 	}
+	hash := sha256.Sum256(signBytes)
 
 	return &vm.UnsignedTx{
 		RawBytes: rawBytes,
-		Hash:     signBytes,
+		Hash:     hash[:],
 		To:       req.To,
 		Value:    req.Value,
 	}, nil
 }
 
-// ExtractSignableBytes returns the canonical sign bytes.
+// ExtractSignableBytes returns the sha256 hash of the canonical sign bytes.
 func (a *Adapter) ExtractSignableBytes(unsignedTx []byte) ([]byte, error) {
 	signBytes, err := sdk.SortJSON(unsignedTx)
 	if err != nil {
-		return unsignedTx, nil
+		signBytes = unsignedTx
 	}
-	return signBytes, nil
+	hash := sha256.Sum256(signBytes)
+	return hash[:], nil
 }
 
 // AssembleSignedTx wraps the unsigned tx and signature into a signed envelope.
@@ -127,9 +131,17 @@ func (a *Adapter) AssembleSignedTx(unsignedTx []byte, sig *tss.Signature) ([]byt
 		Signature string          `json:"signature"`
 	}
 
+	// Zero-pad R and S to 32 bytes each.
+	rBytes := make([]byte, 32)
+	sBytes := make([]byte, 32)
+	rB := sig.R.Bytes()
+	sB := sig.S.Bytes()
+	copy(rBytes[32-len(rB):], rB)
+	copy(sBytes[32-len(sB):], sB)
+
 	env := signedEnvelope{
 		Tx:        unsignedTx,
-		Signature: fmt.Sprintf("%x%x", sig.R.Bytes(), sig.S.Bytes()),
+		Signature: hex.EncodeToString(rBytes) + hex.EncodeToString(sBytes),
 	}
 
 	raw, err := json.Marshal(env)

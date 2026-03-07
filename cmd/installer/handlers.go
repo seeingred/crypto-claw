@@ -25,6 +25,7 @@ func registerAPIRoutes(mux *http.ServeMux, state *WizardState) {
 	mux.HandleFunc("POST /api/servers/test", handleServersTest(state))
 	mux.HandleFunc("POST /api/servers/save", handleServersSave(state))
 	mux.HandleFunc("POST /api/llm/save", handleLLMSave(state))
+	mux.HandleFunc("POST /api/llm/skip", handleLLMSkip(state))
 	mux.HandleFunc("POST /api/telegram/save", handleTelegramSave(state))
 	mux.HandleFunc("POST /api/telegram/verify", handleTelegramVerify(state))
 	mux.HandleFunc("POST /api/install/prepare", handleInstallPrepare(state))
@@ -363,6 +364,24 @@ func handleLLMSave(state *WizardState) http.HandlerFunc {
 		state.mu.Unlock()
 
 		slog.Info("LLM config saved", "provider", req.Provider, "model", req.Model)
+
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	}
+}
+
+// handleLLMSkip skips LLM setup — Party B will use deterministic checks + whitelist only.
+func handleLLMSkip(state *WizardState) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		state.mu.Lock()
+		state.LLMProvider = ""
+		state.LLMAPIKey = ""
+		state.LLMModel = ""
+		state.LLMEndpoint = ""
+		state.DisableAI = true
+		state.Step = "llm"
+		state.mu.Unlock()
+
+		slog.Info("LLM setup skipped — AI disabled, deterministic + whitelist mode")
 
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	}

@@ -18,11 +18,15 @@ func (b *Bot) handleCallback(query *tgbotapi.CallbackQuery) {
 	switch {
 	case strings.HasPrefix(data, "approve:"):
 		txID := strings.TrimPrefix(data, "approve:")
-		b.handleTxDecision(query, txID, true)
+		b.handleTxDecision(query, txID, true, false)
+
+	case strings.HasPrefix(data, "whitelist:"):
+		txID := strings.TrimPrefix(data, "whitelist:")
+		b.handleTxDecision(query, txID, true, true)
 
 	case strings.HasPrefix(data, "reject:"):
 		txID := strings.TrimPrefix(data, "reject:")
-		b.handleTxDecision(query, txID, false)
+		b.handleTxDecision(query, txID, false, false)
 
 	case data == "settings:auto":
 		b.SetAutoMode(true)
@@ -57,10 +61,12 @@ func (b *Bot) handleMessage(msg *tgbotapi.Message) {
 	}
 }
 
-// handleTxDecision processes approve/reject button presses.
-func (b *Bot) handleTxDecision(query *tgbotapi.CallbackQuery, txID string, approved bool) {
+// handleTxDecision processes approve/reject/whitelist button presses.
+func (b *Bot) handleTxDecision(query *tgbotapi.CallbackQuery, txID string, approved bool, whitelist bool) {
 	action := "Rejected"
-	if approved {
+	if approved && whitelist {
+		action = "Approved & Whitelisted"
+	} else if approved {
 		action = "Approved"
 	}
 
@@ -75,6 +81,11 @@ func (b *Bot) handleTxDecision(query *tgbotapi.CallbackQuery, txID string, appro
 		)
 		edit.ParseMode = "Markdown"
 		b.api.Send(edit)
+	}
+
+	// Whitelist the address if requested.
+	if whitelist && b.onWhitelist != nil {
+		b.onWhitelist(txID)
 	}
 
 	// Route decision back to the service.

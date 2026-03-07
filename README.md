@@ -74,7 +74,7 @@ This clones the repo, builds the binary, and launches the wizard. Requires Go 1.
 
 **Party A** (AI server) exposes a localhost REST API for the bot. It builds chain-specific transactions, initiates TSS signing with Party B, and returns signed transactions.
 
-**Party B** (secure server) validates transactions using an AI-driven analyzer (deterministic ABI checks + LLM analysis) before co-signing. Uncertain transactions are escalated to the user via Telegram.
+**Party B** (secure server) validates transactions before co-signing. The TX analyzer independently decodes the unsigned transaction via VM adapters, verifies signable bytes match, checks destination addresses against a whitelist, and optionally runs LLM analysis. Whitelisted addresses are auto-approved (with notification); unknown addresses are escalated to the user via Telegram with decoded transaction details and an "Approve & Whitelist" option.
 
 ## Supported Chains
 
@@ -125,7 +125,7 @@ The installer runs on your local machine (not on either server) and guides you t
 1. **Welcome** — explains the two-server architecture
 2. **Server configuration** — SSH access to both servers (password or key auth), with optional localhost mode for testing
 3. **Key generation (DKG)** — generates ECDSA (secp256k1) and EdDSA (ed25519) master keys via 2-of-2 DKG ceremony
-4. **LLM setup** — configure OpenAI, Anthropic, or a local model endpoint for the TX analyzer
+4. **LLM setup** — configure OpenAI, Anthropic, or a local model endpoint for the TX analyzer, or skip to use deterministic checks + whitelist only
 5. **Telegram bot** — instructions for BotFather, prompts for bot token
 6. **Telegram authorization** — waits for the first message to verify user identity
 7. **Review** — displays all settings before deployment
@@ -207,6 +207,10 @@ Both services are configured via a JSON file (`config.json`). See `internal/conf
   },
   "analyzer": {
     "autoMode": true,
+    "disableAI": false,
+    "whitelist": [
+      { "address": "0x...", "label": "Treasury" }
+    ],
     "llm": {
       "provider": "anthropic",
       "apiKey": "sk-ant-...",
@@ -356,20 +360,25 @@ Check service health.
 
 1. Bot sends `POST /sign` to Party A
 2. Party A builds unsigned transaction via the appropriate VM adapter
-3. Party A sends sign request to Party B over mutual TLS
-4. Party B runs the TX analyzer (deterministic ABI checks + LLM analysis)
-5. Party B decides: **approve**, **reject**, or **escalate**
-6. If rejected → Party A returns error to bot
-7. If escalated → Party B notifies user via Telegram; bot polls `GET /sign/:txId`
-8. If approved → both parties run TSS signing protocol
-9. Party A assembles the signed transaction
-10. Party A returns signed transaction to bot
-11. Bot broadcasts to the blockchain
+3. Party A extracts signable bytes and sends sign request to Party B over mutual TLS
+4. Party B independently decodes the unsigned transaction via its own VM adapter
+5. Party B verifies signable bytes match the decoded transaction
+6. Party B checks destination addresses against the whitelist
+7. Party B optionally runs LLM analysis with decoded transaction context
+8. Party B decides: **approve**, **reject**, or **escalate**
+9. If rejected (signable bytes mismatch, zero address, etc.) → Party A returns error to bot
+10. If whitelisted + autoMode → auto-approve, send notification, start TSS signing
+11. If escalated → Party B notifies user via Telegram with decoded tx details; user can Approve, Approve & Whitelist, or Reject; bot polls `GET /sign/:txId`
+12. If approved → both parties run TSS signing protocol
+13. Party A assembles the signed transaction
+14. Party A returns signed transaction to bot
+15. Bot broadcasts to the blockchain
 
 ## Security Model
 
 - **Compromised AI server**: attacker gets Party A's key share (useless alone), can send signing requests but cannot bypass Party B's validation
-- **Protection layers**: deterministic ABI checks, LLM-based analysis, user escalation via Telegram, mutual TLS transport
+- **Protection layers**: independent tx decoding and signable bytes verification, address whitelisting, deterministic checks, optional LLM analysis, user escalation via Telegram, mutual TLS transport
+- **Signable bytes verification**: Party B independently extracts the signable hash from the unsigned transaction and rejects if it doesn't match what Party A claimed — prevents signing tampered data
 - **Key storage**: shares encrypted with AES-256-GCM in PostgreSQL
 - **Transport**: mutual TLS with self-signed CA; both parties pin each other's certificates
 - **Containers**: non-root user, read-only config mounts, no exposed ports beyond the required ones

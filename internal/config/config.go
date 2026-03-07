@@ -84,9 +84,17 @@ type TendermintChainConfig struct {
 }
 
 type AnalyzerConfig struct {
-	LLM          LLMConfig `json:"llm"`
-	AutoMode     bool      `json:"autoMode"`     // true = AI decides, false = manual approval
-	ExplorerAPIs map[string]string `json:"explorerApis"` // chain -> API key
+	LLM          LLMConfig         `json:"llm"`
+	AutoMode     bool              `json:"autoMode"`              // true = AI decides, false = manual approval
+	DisableAI    bool              `json:"disableAI,omitempty"`   // true = no LLM, deterministic + whitelist only
+	ExplorerAPIs map[string]string `json:"explorerApis,omitempty"` // chain -> API key
+	Whitelist    []WhitelistSeed   `json:"whitelist,omitempty"`   // seed addresses to pre-populate
+}
+
+// WhitelistSeed is an address to seed into the whitelist on startup.
+type WhitelistSeed struct {
+	Address string `json:"address"`
+	Label   string `json:"label,omitempty"`
 }
 
 type LLMConfig struct {

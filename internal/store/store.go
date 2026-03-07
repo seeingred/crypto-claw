@@ -7,10 +7,11 @@ import (
 	"github.com/seeingred/crypto-claw/internal/tss"
 )
 
-// Store defines the persistence interface for key shares and transaction history.
+// Store defines the persistence interface for key shares, transaction history, and whitelist.
 type Store interface {
 	KeyStore
 	TxStore
+	WhitelistStore
 	Close() error
 }
 
@@ -98,4 +99,20 @@ type TxFilter struct {
 	DerivationPath *string
 	Limit          int
 	Offset         int
+}
+
+// WhitelistEntry represents a whitelisted address.
+type WhitelistEntry struct {
+	Address string    `json:"address"`
+	Label   string    `json:"label"`
+	AddedAt time.Time `json:"addedAt"`
+}
+
+// WhitelistStore manages the address whitelist.
+type WhitelistStore interface {
+	AddWhitelistEntry(ctx context.Context, entry *WhitelistEntry) error
+	RemoveWhitelistEntry(ctx context.Context, address string) error
+	IsWhitelisted(ctx context.Context, address string) (bool, error)
+	GetWhitelistEntry(ctx context.Context, address string) (*WhitelistEntry, error)
+	ListWhitelist(ctx context.Context) ([]*WhitelistEntry, error)
 }

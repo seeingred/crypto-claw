@@ -131,36 +131,48 @@ RESPONSE:
 { "decision": "approve" | "reject" | "escalate", "reason": "..." }
 ```
 
-**TX Analyzer AI**:
+**TX Analyzer**:
 
-The TX analyzer is the sole validation layer on Party B. It combines deterministic checks with LLM-based reasoning:
+The TX analyzer is the sole validation layer on Party B. It independently verifies transactions using a multi-stage pipeline:
 
-- **Deterministic checks** (always run first):
-  - Fetches contract ABI automatically from block explorers (Etherscan, Solscan, etc.) or on-chain metadata
-  - Caches fetched ABIs locally to avoid repeated lookups
-  - Decodes calldata using the fetched ABI
-  - Validates parameter encoding and types
+- **Transaction decoding** (always run first):
+  - Party B has its own VM adapter registry (EVM, Solana, Tendermint) and independently decodes the unsigned transaction from raw bytes
+  - Extracts actual to/value/data from the decoded transaction rather than trusting claimed fields from Party A
+  - Verifies signable bytes: recomputes the hash from the decoded transaction and rejects if it doesn't match what Party A sent (prevents signing tampered data)
+  - Checks for field mismatches between claimed and decoded values (to, value)
+
+- **Address whitelist**:
+  - Maintains a persistent whitelist of trusted destination addresses in PostgreSQL
+  - Addresses can be seeded from config, added via "Approve & Whitelist" in Telegram, or managed via the store
+  - When autoMode=true and the destination is whitelisted: auto-approve with a non-interactive Telegram notification
+  - When autoMode=false or the address is not whitelisted: escalate to user
+
+- **Deterministic checks**:
+  - Rejects transactions to zero addresses
+  - Rejects transactions with no recipients
+  - Flags high-value transactions for escalation
+  - Decodes calldata using ABI resolver (contract function calls)
   - If ABI cannot be fetched (unverified contract), flags as higher risk
-  - Verifies derivation path is expected
 
-- **LLM-based analysis** (run after deterministic checks):
-  - Connects to an LLM API (OpenAI, Anthropic, or a locally-hosted model — configurable, model runtime itself is out of scope)
-  - Receives decoded transaction context (or raw calldata if ABI unavailable) for intent classification
-  - Considers risk signals (unverified contract, unusual parameters, large values)
+- **LLM-based analysis** (optional, run after deterministic checks):
+  - Can be fully disabled via `disableAI` config flag (installer offers a "Skip LLM" option)
+  - When enabled, connects to an LLM API (OpenAI, Anthropic, or a locally-hosted model)
+  - Receives rich context: decoded transaction details, chain info, whitelist status, method calls, warnings, field mismatches
   - Outputs confidence score and classification
   - Decision matrix:
-    - High confidence + expected pattern → auto-approve → co-sign
+    - High confidence + expected pattern → approve
     - Low confidence, unusual pattern, or unverified contract → escalate to user
     - Clearly malicious or nonsensical → reject
 
-- **Manual confirmation mode**: TX analyzer can be fully disabled via a toggle button in the Telegram bot settings menu. When disabled, all transactions are routed directly to the user for manual approval via Telegram. Useful when the user wants to approve transactions the analyzer would otherwise reject (e.g. sending funds to a new wallet).
+- **Manual confirmation mode**: TX analyzer can be fully disabled via a toggle button in the Telegram bot settings menu. When disabled, all transactions are routed directly to the user for manual approval via Telegram.
 
-- **Configuration**: LLM connection settings and block explorer API keys stored as config files on the secure server, editable only with direct access. No manual ABI curation needed.
+- **Configuration**: LLM connection settings stored as config files on the secure server. LLM is optional — the system works with deterministic checks + whitelist alone.
 
 **User Escalation**:
 
 - When TX analyzer is uncertain (or manual mode is enabled), notification sent to user via Telegram bot
-- User can approve or reject via Telegram
+- Telegram notification includes decoded transaction details: chain, destination, value, method call, warnings, AI verdict (if enabled)
+- User can: **Approve**, **Approve & Whitelist** (adds destination to trusted list for future auto-approval), or **Reject**
 - Escalated transactions are queued, not dropped
 - Configurable timeout: if user doesn't respond within X minutes, default to reject
 
@@ -242,21 +254,27 @@ The setup is driven by the **Installer** (see below) running on a local machine.
 1.  Bot → Party A:  POST /sign { ... }
 2.  Party A:        VM adapter builds unsigned tx
 3.  Party A:        Extracts signable bytes
-4.  Party A → B:    Sends SIGN_REQUEST with tx details
-5.  Party B:        TX analyzer runs deterministic ABI checks
-6.  Party B:        TX analyzer runs LLM analysis (if checks pass)
-7.  Party B:        Decision: approve / reject / escalate
-8.  If rejected:    Party A returns error to bot
-9.  If escalated:   Party B sends Telegram notification with tx details + Approve/Reject buttons
+4.  Party A → B:    Sends SIGN_REQUEST with unsigned tx, signable bytes, and claimed fields
+5.  Party B:        Decodes unsigned tx independently via VM adapter
+6.  Party B:        Verifies signable bytes match decoded tx (rejects on mismatch)
+7.  Party B:        Checks destination against address whitelist
+8.  Party B:        Runs deterministic checks (zero address, high value, etc.)
+9.  Party B:        Optionally runs LLM analysis with decoded tx context
+10. Party B:        Decision: approve / reject / escalate
+11. If rejected:    Party A returns error to bot
+12. If whitelisted  Party B auto-approves, sends notification, starts TSS signing
+    + autoMode:
+13. If escalated:   Party B sends Telegram notification with decoded tx details
+                    + Approve / Approve & Whitelist / Reject buttons
                     Party A returns { txId, status: "pending_review" } to bot
                     Bot polls GET /sign/:txId until resolved
-                    User approves/rejects via Telegram
+                    User approves/rejects/whitelists via Telegram
                     On approval: TSS signing proceeds, signed tx stored for bot retrieval
                     On rejection or timeout: status updated to "rejected"
-10. If approved:    Both parties run TSS signing protocol
-11. Party A:        Assembles signed transaction
-12. Party A → Bot:  Returns signed transaction (or stores for poll retrieval if escalated)
-13. Bot:            Validates, decides whether to broadcast to chain
+14. If approved:    Both parties run TSS signing protocol
+15. Party A:        Assembles signed transaction
+16. Party A → Bot:  Returns signed transaction (or stores for poll retrieval if escalated)
+17. Bot:            Validates, decides whether to broadcast to chain
 ```
 
 ---
@@ -334,9 +352,9 @@ A web dashboard served by Party A for operational visibility.
   - ECDSA master (secp256k1) for EVM, Cosmos
   - EdDSA master (ed25519) for Solana
 - Spin up Party A and Party B locally
-- Derive EVM and Solana addresses
+- Derive EVM, Solana, and Cosmos addresses
 - Restore from the same seed/master keys
-- Derive EVM and Solana addresses using the same paths — verify they match
+- Derive EVM, Solana, and Cosmos addresses using the same paths — verify they match
 
 ### Test preparation (shared setup for cases 2-4)
 - Generate new master keys via DKG:
@@ -405,7 +423,7 @@ A web dashboard served by Party A for operational visibility.
 - It explains that I need two servers: an AI server (where I'll run OpenClaw or a similar AI bot) and a secure server (which should run nothing else but the co-signer software)
 - When I proceed, it prompts me for SSH access to both servers, where I can provide SSH credentials and/or keys (it also offers an optional localhost installation for testing purposes)
 - When I proceed, it generates two master extended private keys (ECDSA + EdDSA), displays seed phrases, and prompts me to copy and save them in a secure location. Before moving to the next step, it warns me that without the private keys I cannot recover the wallets
-- Next step asks me to provide an OpenAI key, Anthropic key, or a locally-hosted model endpoint, and select a model in case of OpenAI or Anthropic (via API)
+- Next step asks me to provide an OpenAI key, Anthropic key, or a locally-hosted model endpoint, and select a model in case of OpenAI or Anthropic (via API). I can also skip this step to use deterministic checks + whitelist only (no LLM dependency)
 - Next step provides instructions for creating a Telegram bot via BotFather, and prompts me for the bot token
 - Next step waits for the first message to this Telegram bot, then authorizes that Telegram user as the sole actor authorized to send messages to the bot
 - After all settings are configured, I review them and press OK to proceed with installation
@@ -420,8 +438,8 @@ A web dashboard served by Party A for operational visibility.
 - As a bot, I can check the health of the AI server
 
 ### User communicates with secure server via Telegram
-- I receive a message with transaction details (decoded calldata, destination address, value, risk assessment) and two inline buttons: **Approve** and **Reject**
-- I tap Approve or Reject to approve or reject signing of the transaction
+- I receive a message with decoded transaction details (chain, destination address, value, method call if contract interaction, warnings, AI verdict if enabled) and three inline buttons: **Approve**, **Approve & Whitelist**, and **Reject**
+- I tap Approve to approve signing, Approve & Whitelist to approve and add the destination to my trusted addresses for future auto-approval, or Reject to reject the transaction
 - I can open a **Settings** menu (via a persistent menu button) which has a toggle button to switch between **Auto mode** (TX analyzer decides, escalates uncertain txs) and **Manual mode** (all transactions sent to me for approval)
 
 ### Documentation

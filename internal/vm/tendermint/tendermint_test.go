@@ -1,9 +1,13 @@
 package tendermint
 
 import (
+	"bytes"
+	"context"
 	"encoding/hex"
 	"strings"
 	"testing"
+
+	"github.com/seeingred/crypto-claw/internal/vm"
 )
 
 func TestDeriveAddress(t *testing.T) {
@@ -74,5 +78,69 @@ func TestDeriveAddressCustomPrefix(t *testing.T) {
 
 	if !strings.HasPrefix(addr, "osmo1") {
 		t.Errorf("expected osmo1 prefix, got %s", addr)
+	}
+}
+
+func TestBuildAndDecodeTx(t *testing.T) {
+	a := New("cosmos", "uatom")
+
+	unsignedTx, err := a.BuildUnsignedTx(context.Background(), &vm.TxRequest{
+		From:    "cosmos1abc",
+		To:      []string{"cosmos1def"},
+		Value:   "1000000",
+		ChainID: "cosmoshub-4",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unsignedTx.RawBytes) == 0 {
+		t.Fatal("raw bytes empty")
+	}
+	if len(unsignedTx.Hash) != 32 {
+		t.Fatalf("expected 32-byte hash, got %d", len(unsignedTx.Hash))
+	}
+
+	decoded, err := a.DecodeTx(unsignedTx.RawBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.From != "cosmos1abc" {
+		t.Errorf("from = %q, want cosmos1abc", decoded.From)
+	}
+	if len(decoded.To) != 1 || decoded.To[0] != "cosmos1def" {
+		t.Errorf("to = %v, want [cosmos1def]", decoded.To)
+	}
+	if decoded.Value != "1000000" {
+		t.Errorf("value = %q, want 1000000", decoded.Value)
+	}
+	if decoded.ChainID != "cosmoshub-4" {
+		t.Errorf("chainID = %q, want cosmoshub-4", decoded.ChainID)
+	}
+}
+
+func TestExtractSignableBytes(t *testing.T) {
+	a := New("cosmos", "uatom")
+
+	unsignedTx, err := a.BuildUnsignedTx(context.Background(), &vm.TxRequest{
+		From:    "cosmos1abc",
+		To:      []string{"cosmos1def"},
+		Value:   "1000000",
+		ChainID: "cosmoshub-4",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	signable, err := a.ExtractSignableBytes(unsignedTx.RawBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(signable) != 32 {
+		t.Fatalf("expected 32-byte hash, got %d", len(signable))
+	}
+
+	// Must match what BuildUnsignedTx produced.
+	if !bytes.Equal(signable, unsignedTx.Hash) {
+		t.Error("ExtractSignableBytes does not match BuildUnsignedTx hash")
 	}
 }

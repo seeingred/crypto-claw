@@ -10,6 +10,7 @@ import (
 	"github.com/seeingred/crypto-claw/internal/tss"
 	"github.com/seeingred/crypto-claw/internal/vm/evm"
 	"github.com/seeingred/crypto-claw/internal/vm/solana"
+	"github.com/seeingred/crypto-claw/internal/vm/tendermint"
 	"github.com/seeingred/crypto-claw/tests/testutil"
 )
 
@@ -61,6 +62,17 @@ func TestWalletCreation_DKG_ECDSA(t *testing.T) {
 		t.Fatalf("unexpected EVM address length: %d", len(addr))
 	}
 	t.Logf("Derived EVM address: %s", addr)
+
+	// Derive Cosmos address from the same ECDSA key.
+	cosmosAdapter := tendermint.New("cosmos", "uatom")
+	cosmosAddr, err := cosmosAdapter.DeriveAddress(shareA.PublicKey)
+	if err != nil {
+		t.Fatal("derive Cosmos address:", err)
+	}
+	if cosmosAddr == "" {
+		t.Fatal("derived Cosmos address is empty")
+	}
+	t.Logf("Derived Cosmos address: %s", cosmosAddr)
 }
 
 // TestWalletCreation_DKG_EdDSA verifies DKG for ed25519 (Solana).
@@ -213,6 +225,15 @@ func TestWalletRestoration(t *testing.T) {
 	}
 	t.Logf("Original Solana address: %s", origSolAddr)
 
+	cosmosPath := "m/44'/118'/0'/0/0"
+	origCosmosPubA, _ := testutil.RunDerive(ctx, t, cluster, protocol, tss.CurveSecp256k1, cosmosPath)
+	cosmosAdapter := tendermint.New("cosmos", "uatom")
+	origCosmosAddr, err := cosmosAdapter.DeriveAddress(origCosmosPubA)
+	if err != nil {
+		t.Fatal("derive original Cosmos address:", err)
+	}
+	t.Logf("Original Cosmos address: %s", origCosmosAddr)
+
 	// --- Step 3: Serialize shares to JSON (simulating installer backup) ---
 	ecdsaShareA, _ := cluster.PartyA.GetKeyShare(tss.CurveSecp256k1)
 	ecdsaShareB, _ := cluster.PartyB.GetKeyShare(tss.CurveSecp256k1)
@@ -287,6 +308,19 @@ func TestWalletRestoration(t *testing.T) {
 		t.Fatalf("Solana address mismatch after restore: original=%s restored=%s", origSolAddr, restoredSolAddr)
 	}
 	t.Logf("Restored Solana address matches: %s", restoredSolAddr)
+
+	restoredCosmosPubA, restoredCosmosPubB := testutil.RunDerive(ctx, t, restoredCluster, protocol, tss.CurveSecp256k1, cosmosPath)
+	if !bytes.Equal(restoredCosmosPubA, restoredCosmosPubB) {
+		t.Fatal("restored: Cosmos derived public keys differ between parties")
+	}
+	restoredCosmosAddr, err := cosmosAdapter.DeriveAddress(restoredCosmosPubA)
+	if err != nil {
+		t.Fatal("derive restored Cosmos address:", err)
+	}
+	if restoredCosmosAddr != origCosmosAddr {
+		t.Fatalf("Cosmos address mismatch after restore: original=%s restored=%s", origCosmosAddr, restoredCosmosAddr)
+	}
+	t.Logf("Restored Cosmos address matches: %s", restoredCosmosAddr)
 }
 
 // TestDeriveAddress_EVM verifies EVM address derivation from a known public key.

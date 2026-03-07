@@ -48,6 +48,7 @@ type WizardState struct {
 	LLMAPIKey   string `json:"-"`
 	LLMModel    string `json:"llmModel,omitempty"`
 	LLMEndpoint string `json:"llmEndpoint,omitempty"`
+	DisableAI   bool   `json:"disableAI,omitempty"` // skip LLM, deterministic + whitelist only
 
 	// Telegram configuration.
 	TelegramBotToken    string `json:"-"`
@@ -102,7 +103,8 @@ func (s *WizardState) SanitizedState() map[string]any {
 		"llmProvider":    s.LLMProvider,
 		"llmModel":       s.LLMModel,
 		"llmEndpoint":    s.LLMEndpoint,
-		"llmConfigured":  s.LLMProvider != "",
+		"llmConfigured":  s.LLMProvider != "" || s.DisableAI,
+		"disableAI":      s.DisableAI,
 		"telegramConfigured":   s.TelegramBotToken != "",
 		"telegramBotUsername":  s.TelegramBotUsername,
 		"telegramUserId":      s.TelegramUserID,
