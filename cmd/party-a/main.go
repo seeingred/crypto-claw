@@ -62,16 +62,18 @@ func main() {
 	proto := tss.NewProtocol(0) // 2-of-2 threshold
 
 	// Initialize VM adapter registry.
+	// All adapters are always registered — chain config provides RPC URLs, not adapter enablement.
 	registry := vm.NewRegistry()
-	if len(cfg.Chains.EVM) > 0 {
-		registry.Register([]string{"60"}, evm.New())
+	registry.Register([]string{"60"}, evm.New())
+	registry.Register([]string{"501"}, solana.New())
+
+	// Use config prefix/denom if available, otherwise defaults.
+	tmPrefix, tmDenom := "", ""
+	if len(cfg.Chains.Tendermint) > 0 {
+		tmPrefix = cfg.Chains.Tendermint[0].Prefix
+		tmDenom = cfg.Chains.Tendermint[0].Denom
 	}
-	if len(cfg.Chains.Solana) > 0 {
-		registry.Register([]string{"501"}, solana.New())
-	}
-	for _, chain := range cfg.Chains.Tendermint {
-		registry.Register([]string{"118"}, tendermint.New(chain.Prefix, chain.Denom))
-	}
+	registry.Register([]string{"118"}, tendermint.New(tmPrefix, tmDenom))
 
 	// Create transport adapter.
 	tc := &transportAdapter{client: client}

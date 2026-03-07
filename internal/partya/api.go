@@ -281,13 +281,29 @@ for analysis before signing. There are three possible outcomes:
 2. **Pending review** → escalated to owner via Telegram (HTTP 202). Poll /sign/{txId}
 3. **Rejected** → transaction denied by the analyzer (HTTP 200, status: "rejected")
 
-**Request:**
+The endpoint is chain-agnostic. The derivationPath determines which VM adapter
+handles the request. Only derivationPath and to are required — all other fields
+are chain-specific and ignored by adapters that don't use them.
+
+**Request fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| derivationPath | string | yes | BIP-44 path of the signing key |
+| to | string[] | yes | Recipient address(es) |
+| value | string | no | Value in smallest unit (wei, lamports, uatom) |
+| data | string | no | Hex-encoded calldata (EVM) or mint address (Solana SPL) |
+| chainId | string | no | EVM chain ID (1=Ethereum, 56=BSC, 137=Polygon) or Cosmos chain ID |
+| gasLimit | number | no | EVM gas limit |
+| gasPrice | string | no | EVM gas price in wei |
+| nonce | number | no | EVM transaction nonce |
+
+**EVM example** (ETH transfer):
 ` + "```json" + `
 {
   "derivationPath": "m/44'/60'/0'/0/0",
   "to": ["0xRecipientAddress"],
   "value": "1000000000000000000",
-  "data": "0x",
   "chainId": "1",
   "gasLimit": 21000,
   "gasPrice": "20000000000",
@@ -295,16 +311,32 @@ for analysis before signing. There are three possible outcomes:
 }
 ` + "```" + `
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| derivationPath | string | yes | BIP-44 path of the signing key |
-| to | string[] | yes | Recipient address(es) |
-| value | string | no | Value in smallest unit (wei for EVM, lamports for SOL) |
-| data | string | no | Hex-encoded calldata (0x prefix optional) |
-| chainId | string | no | Chain ID (1=Ethereum, 56=BSC, 137=Polygon, etc.) |
-| gasLimit | number | no | Gas limit |
-| gasPrice | string | no | Gas price in wei |
-| nonce | number | no | Transaction nonce (fetch from chain if unsure) |
+**Solana example** (SOL transfer):
+` + "```json" + `
+{
+  "derivationPath": "m/44'/501'/0'/0'",
+  "to": ["RecipientBase58Address"],
+  "value": "1000000000"
+}
+` + "```" + `
+
+**Cosmos example** (ATOM transfer):
+` + "```json" + `
+{
+  "derivationPath": "m/44'/118'/0'/0/0",
+  "to": ["cosmos1recipient..."],
+  "value": "1000000",
+  "chainId": "cosmoshub-4"
+}
+` + "```" + `
+
+**Notes:**
+- Solana: the recent blockhash is set to a placeholder. The bot should fetch
+  the latest blockhash from Solana RPC and inject it before broadcasting.
+- Solana SPL: pass the mint address as hex in the data field.
+- EVM: if gasLimit/gasPrice/nonce are omitted, defaults are used. For production,
+  fetch these from the chain RPC before signing.
+- signedTx is returned as 0x-prefixed hex for all chains.
 
 **Response (signed):** HTTP 200
 ` + "```json" + `

@@ -4,7 +4,7 @@
   import Input from '../components/Input.svelte';
   import Alert from '../components/Alert.svelte';
   import { currentStep, wizardState, isLoading } from '../stores.js';
-  import { saveLLMConfig } from '../api.js';
+  import { saveLLMConfig, skipLLM } from '../api.js';
 
   let state = $state({});
   wizardState.subscribe((s) => (state = s));
@@ -75,6 +75,18 @@
         model: llm.model,
         localEndpoint: llm.localEndpoint,
       });
+    } catch {
+      // Proceed anyway
+    } finally {
+      isLoading.set(false);
+    }
+    currentStep.update((n) => n + 1);
+  }
+
+  async function handleSkip() {
+    isLoading.set(true);
+    try {
+      await skipLLM();
     } catch {
       // Proceed anyway
     } finally {
@@ -221,6 +233,8 @@
           The LLM analyzes each transaction request to detect anomalies,
           validate parameters, and ensure compliance with your trading
           policies before the co-signer approves it.
+          You can also <strong>skip this step</strong> to use deterministic
+          checks and address whitelisting only — no LLM dependency required.
         </p>
       </Alert>
     </div>
@@ -233,11 +247,16 @@
       </svg>
       Back
     </Button>
-    <Button onclick={handleNext}>
-      Next
-      <svg class="w-4 h-4 ml-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-        <path stroke-linecap="round" stroke-linejoin="round" d="M13 7l5 5m0 0l-5 5m5-5H6" />
-      </svg>
-    </Button>
+    <div class="flex gap-3">
+      <Button variant="secondary" onclick={handleSkip}>
+        Skip — No AI
+      </Button>
+      <Button onclick={handleNext}>
+        Next
+        <svg class="w-4 h-4 ml-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M13 7l5 5m0 0l-5 5m5-5H6" />
+        </svg>
+      </Button>
+    </div>
   </div>
 </div>

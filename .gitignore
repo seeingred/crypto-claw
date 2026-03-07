@@ -34,3 +34,4 @@ build/
 cmd/installer/ui/dist/
 crypto-claw-installer
 bin/
+party-a

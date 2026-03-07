@@ -84,6 +84,12 @@ export async function saveLLMConfig(config) {
   });
 }
 
+export async function skipLLM() {
+  return request('/llm/skip', {
+    method: 'POST',
+  });
+}
+
 export async function saveTelegramToken(token) {
   return request('/telegram/save', {
     method: 'POST',

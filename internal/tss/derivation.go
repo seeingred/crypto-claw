@@ -14,6 +14,7 @@ import (
 
 	"github.com/bnb-chain/tss-lib/v2/crypto"
 	"github.com/bnb-chain/tss-lib/v2/ecdsa/keygen"
+	edkeygen "github.com/bnb-chain/tss-lib/v2/eddsa/keygen"
 	"github.com/bnb-chain/tss-lib/v2/tss"
 )
 
@@ -22,39 +23,36 @@ const (
 	hardenedOffset = 0x80000000
 )
 
-// DeriveKey derives a child key from a master key share using BIP-32 HD derivation.
+// DeriveKey derives a child key from a master key share using BIP-32 style HD derivation.
+// Works for both secp256k1 (ECDSA) and ed25519 (EdDSA) using non-hardened derivation
+// with the compressed public key. Standard hardened derivation requires the full private
+// key which no single party holds in TSS — the hardened bit in the index is preserved
+// for BIP-44 path compatibility but does not change the derivation method.
 func (p *TSSProtocol) DeriveKey(ctx context.Context, masterShare *KeyShare, derivationPath string) (*DerivedKey, error) {
-	if masterShare.Curve == CurveEd25519 {
-		// EdDSA (ed25519) does not support BIP-32 HD derivation in a TSS context
-		// because SLIP-0010 requires hardened derivation which needs the full private key.
-		// Return the master key as-is; the derivation path is tracked but the key material
-		// is unchanged.
-		return &DerivedKey{
-			Curve:          masterShare.Curve,
-			DerivationPath: derivationPath,
-			Share:          masterShare.Share,
-			PublicKey:      masterShare.PublicKey,
-		}, nil
-	}
-
-	if masterShare.Curve != CurveSecp256k1 {
-		return nil, ErrDerivationFailed.WithCause(fmt.Errorf(
-			"BIP-32 derivation only supported for secp256k1, got %s",
-			masterShare.Curve,
-		))
-	}
-
 	indices, err := parsePath(derivationPath)
 	if err != nil {
 		return nil, ErrDerivationFailed.WithCause(err)
 	}
 
+	switch masterShare.Curve {
+	case CurveSecp256k1:
+		return deriveECDSA(masterShare, derivationPath, indices)
+	case CurveEd25519:
+		return deriveEdDSA(masterShare, derivationPath, indices)
+	default:
+		return nil, ErrDerivationFailed.WithCause(fmt.Errorf(
+			"derivation not supported for curve %s", masterShare.Curve,
+		))
+	}
+}
+
+// deriveECDSA performs BIP-32 style non-hardened derivation on secp256k1 shares.
+func deriveECDSA(masterShare *KeyShare, derivationPath string, indices []uint32) (*DerivedKey, error) {
 	var save keygen.LocalPartySaveData
 	if err := json.Unmarshal(masterShare.Share, &save); err != nil {
 		return nil, ErrDerivationFailed.WithCause(fmt.Errorf("unmarshal share: %w", err))
 	}
 
-	// Start with master key data.
 	curveParams := tss.S256()
 	parentPubX := save.ECDSAPub.X()
 	parentPubY := save.ECDSAPub.Y()
@@ -69,13 +67,7 @@ func (p *TSSProtocol) DeriveKey(ctx context.Context, masterShare *KeyShare, deri
 		}
 	}
 
-	// Derive through each level of the path.
 	for _, idx := range indices {
-		// In TSS, all derivation uses the compressed public key (non-hardened
-		// style). Standard hardened BIP-32 derivation requires the full private
-		// key, which no single party holds. The hardened bit in the index is
-		// preserved for BIP-44 path compatibility but does not change the
-		// derivation method.
 		compressed := compressPublicKey(parentPubX, parentPubY, curveParams)
 		var data []byte
 		data = append(data, compressed...)
@@ -89,7 +81,6 @@ func (p *TSSProtocol) DeriveKey(ctx context.Context, masterShare *KeyShare, deri
 		il := il_ir[:32]
 		ir := il_ir[32:]
 
-		// il as big.Int, add to parent share mod n.
 		ilInt := new(big.Int).SetBytes(il)
 		n := curveParams.Params().N
 
@@ -97,17 +88,13 @@ func (p *TSSProtocol) DeriveKey(ctx context.Context, masterShare *KeyShare, deri
 			return nil, ErrDerivationFailed.WithCause(fmt.Errorf("derived key >= curve order at index %d", idx))
 		}
 
-		// child_share = parent_share + il mod n
 		childShareXi = new(big.Int).Add(childShareXi, ilInt)
 		childShareXi.Mod(childShareXi, n)
 
-		// child_pub = parent_pub + il*G
 		ilGx, ilGy := curveParams.ScalarBaseMult(il)
 		parentPubX, parentPubY = curveParams.Add(parentPubX, parentPubY, ilGx, ilGy)
 		parentChainCode = ir
 
-		// Update BigXj: each party's public share shifts by il*G
-		// (because each party adds il to their private share in Shamir sharing).
 		for j := range bigXj {
 			if bigXj[j] != nil {
 				newX, newY := curveParams.Add(bigXj[j].X(), bigXj[j].Y(), ilGx, ilGy)
@@ -124,17 +111,111 @@ func (p *TSSProtocol) DeriveKey(ctx context.Context, masterShare *KeyShare, deri
 	copy(pubKeyBytes[33-len(xBytes):33], xBytes)
 	copy(pubKeyBytes[65-len(yBytes):65], yBytes)
 
-	// Build derived save data: clone save and update Xi, ECDSAPub, and BigXj.
+	// Build derived save data.
 	derivedSave := save
 	derivedSave.Xi = childShareXi
 	derivedSave.BigXj = bigXj
 
-	// Update ECDSAPub to the derived public key.
 	derivedPub, err := crypto.NewECPoint(curveParams, parentPubX, parentPubY)
 	if err != nil {
 		return nil, ErrDerivationFailed.WithCause(fmt.Errorf("create derived public key point: %w", err))
 	}
 	derivedSave.ECDSAPub = derivedPub
+
+	derivedShareData, err := json.Marshal(&derivedSave)
+	if err != nil {
+		return nil, ErrDerivationFailed.WithCause(fmt.Errorf("marshal derived share: %w", err))
+	}
+
+	return &DerivedKey{
+		Curve:          masterShare.Curve,
+		DerivationPath: derivationPath,
+		Share:          derivedShareData,
+		PublicKey:      pubKeyBytes,
+	}, nil
+}
+
+// deriveEdDSA performs BIP-32 style non-hardened derivation on ed25519 shares.
+// Uses the same HMAC-SHA512 derivation as ECDSA but on the edwards25519 curve.
+// child_share = parent_share + il mod l, child_pub = parent_pub + il*B.
+func deriveEdDSA(masterShare *KeyShare, derivationPath string, indices []uint32) (*DerivedKey, error) {
+	var save edkeygen.LocalPartySaveData
+	if err := json.Unmarshal(masterShare.Share, &save); err != nil {
+		return nil, ErrDerivationFailed.WithCause(fmt.Errorf("unmarshal share: %w", err))
+	}
+
+	curveParams := tss.Edwards()
+	parentPubX := save.EDDSAPub.X()
+	parentPubY := save.EDDSAPub.Y()
+	parentChainCode := masterShare.ChainCode
+	childShareXi := new(big.Int).Set(save.Xi)
+
+	// Deep copy BigXj.
+	bigXj := make([]*crypto.ECPoint, len(save.BigXj))
+	for i, pt := range save.BigXj {
+		if pt != nil {
+			bigXj[i], _ = crypto.NewECPoint(curveParams, new(big.Int).Set(pt.X()), new(big.Int).Set(pt.Y()))
+		}
+	}
+
+	for _, idx := range indices {
+		compressed := compressPublicKey(parentPubX, parentPubY, curveParams)
+		var data []byte
+		data = append(data, compressed...)
+		indexBytes := make([]byte, 4)
+		binary.BigEndian.PutUint32(indexBytes, idx)
+		data = append(data, indexBytes...)
+
+		mac := hmac.New(sha512.New, parentChainCode)
+		mac.Write(data)
+		il_ir := mac.Sum(nil)
+		il := il_ir[:32]
+		ir := il_ir[32:]
+
+		// Reduce il mod l. For ed25519, l ≈ 2^252.6 while il is 256 bits,
+		// so il >= l roughly 90% of the time. Unlike secp256k1 (where the
+		// BIP-32 spec says to skip invalid indices because it's astronomically
+		// unlikely), we reduce mod l which is standard for ed25519 derivation.
+		ilInt := new(big.Int).SetBytes(il)
+		n := curveParams.Params().N
+		ilInt.Mod(ilInt, n)
+
+		// child_share = parent_share + il mod l
+		childShareXi = new(big.Int).Add(childShareXi, ilInt)
+		childShareXi.Mod(childShareXi, n)
+
+		// child_pub = parent_pub + il*B
+		ilBytes := make([]byte, 32)
+		ilB := ilInt.Bytes()
+		copy(ilBytes[32-len(ilB):], ilB)
+		ilBx, ilBy := curveParams.ScalarBaseMult(ilBytes)
+		parentPubX, parentPubY = curveParams.Add(parentPubX, parentPubY, ilBx, ilBy)
+		parentChainCode = ir
+
+		// Update BigXj: each party's public share shifts by il*B.
+		for j := range bigXj {
+			if bigXj[j] != nil {
+				newX, newY := curveParams.Add(bigXj[j].X(), bigXj[j].Y(), ilBx, ilBy)
+				bigXj[j], _ = crypto.NewECPoint(curveParams, newX, newY)
+			}
+		}
+	}
+
+	// Ed25519 public key is the x-coordinate (32 bytes).
+	pubKeyBytes := make([]byte, 32)
+	xBytes := parentPubX.Bytes()
+	copy(pubKeyBytes[32-len(xBytes):], xBytes)
+
+	// Build derived save data.
+	derivedSave := save
+	derivedSave.Xi = childShareXi
+	derivedSave.BigXj = bigXj
+
+	derivedPub, err := crypto.NewECPoint(curveParams, parentPubX, parentPubY)
+	if err != nil {
+		return nil, ErrDerivationFailed.WithCause(fmt.Errorf("create derived public key point: %w", err))
+	}
+	derivedSave.EDDSAPub = derivedPub
 
 	derivedShareData, err := json.Marshal(&derivedSave)
 	if err != nil {
