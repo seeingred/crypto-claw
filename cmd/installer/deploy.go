@@ -352,6 +352,7 @@ func DeployLocal(state *WizardState, logFn func(string)) error {
 }
 
 // importSharesToDB reads key share JSON files from disk and imports them into the party's PostgreSQL database.
+// If master keys change, all derived keys are cleared to prevent address mismatches.
 func importSharesToDB(dsn string, partyDir string, logFn func(string), party string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -362,33 +363,50 @@ func importSharesToDB(dsn string, partyDir string, logFn func(string), party str
 	}
 	defer st.Close()
 
-	// Import ECDSA share.
-	ecdsaPath := filepath.Join(partyDir, "ecdsa_share.json")
-	if data, err := os.ReadFile(ecdsaPath); err == nil {
+	importShare := func(path string, curve tss.Curve, label string) error {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil // file doesn't exist, skip
+		}
 		var share tss.KeyShare
 		if err := json.Unmarshal(data, &share); err != nil {
-			return fmt.Errorf("parse ECDSA share: %w", err)
+			return fmt.Errorf("parse %s share: %w", label, err)
 		}
+
+		// Check if a master share already exists with a different public key.
+		existing, err := st.GetMasterShare(ctx, curve)
+		if err == nil && !bytesEqual(existing.PublicKey, share.PublicKey) {
+			logFn(fmt.Sprintf("[%s] WARNING: %s master key changed — clearing old derived keys", party, label))
+			st.ClearDerivedKeys(ctx)
+		}
+
 		if err := st.SaveMasterShare(ctx, &share); err != nil {
-			return fmt.Errorf("save ECDSA share: %w", err)
+			return fmt.Errorf("save %s share: %w", label, err)
 		}
-		logFn(fmt.Sprintf("[%s] ECDSA master share imported.", party))
+		logFn(fmt.Sprintf("[%s] %s master share imported.", party, label))
+		return nil
 	}
 
-	// Import EdDSA share.
-	eddsaPath := filepath.Join(partyDir, "eddsa_share.json")
-	if data, err := os.ReadFile(eddsaPath); err == nil {
-		var share tss.KeyShare
-		if err := json.Unmarshal(data, &share); err != nil {
-			return fmt.Errorf("parse EdDSA share: %w", err)
-		}
-		if err := st.SaveMasterShare(ctx, &share); err != nil {
-			return fmt.Errorf("save EdDSA share: %w", err)
-		}
-		logFn(fmt.Sprintf("[%s] EdDSA master share imported.", party))
+	if err := importShare(filepath.Join(partyDir, "ecdsa_share.json"), tss.CurveSecp256k1, "ECDSA"); err != nil {
+		return err
+	}
+	if err := importShare(filepath.Join(partyDir, "eddsa_share.json"), tss.CurveEd25519, "EdDSA"); err != nil {
+		return err
 	}
 
 	return nil
+}
+
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // killExistingParties finds and kills any running party-a/party-b processes from a previous deploy.

@@ -403,6 +403,12 @@ func (s *PostgresStore) DeleteTx(ctx context.Context, txID string) error {
 	return nil
 }
 
+// ClearDerivedKeys removes all derived keys.
+func (s *PostgresStore) ClearDerivedKeys(ctx context.Context) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM derived_keys`)
+	return err
+}
+
 // Close closes the database connection pool.
 func (s *PostgresStore) Close() error {
 	s.pool.Close()

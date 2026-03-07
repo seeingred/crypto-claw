@@ -3,6 +3,7 @@ package partya
 import (
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sync/atomic"
@@ -132,7 +133,7 @@ type SignRequest struct {
 type SignResult struct {
 	TxID     string `json:"txId,omitempty"`
 	Status   string `json:"status"`
-	SignedTx string `json:"signedTx,omitempty"` // base64 if approved
+	SignedTx string `json:"signedTx,omitempty"` // 0x-prefixed hex RLP
 	Reason   string `json:"reason,omitempty"`
 }
 
@@ -210,7 +211,7 @@ func (s *Service) Sign(ctx context.Context, req *SignRequest) (*SignResult, erro
 
 		return &SignResult{
 			Status:   "signed",
-			SignedTx: base64.StdEncoding.EncodeToString(signedTx),
+			SignedTx: "0x" + hex.EncodeToString(signedTx),
 			Reason:   signResp.Reason,
 		}, nil
 
@@ -338,7 +339,7 @@ func (s *Service) GetSignStatus(ctx context.Context, txID string) (*SignResult, 
 			Reason: pending.Reason,
 		}
 		if pending.SignedTx != nil {
-			result.SignedTx = base64.StdEncoding.EncodeToString(pending.SignedTx)
+			result.SignedTx = "0x" + hex.EncodeToString(pending.SignedTx)
 			if pending.Status == store.TxStatusSigned {
 				s.escalation.Delete(txID)
 			}
@@ -358,7 +359,7 @@ func (s *Service) GetSignStatus(ctx context.Context, txID string) (*SignResult, 
 		Reason: txRecord.Reason,
 	}
 	if txRecord.SignedTx != nil {
-		result.SignedTx = base64.StdEncoding.EncodeToString(txRecord.SignedTx)
+		result.SignedTx = "0x" + hex.EncodeToString(txRecord.SignedTx)
 		if txRecord.Status == store.TxStatusSigned {
 			_ = s.store.DeleteTx(ctx, txID)
 		}
@@ -400,7 +401,7 @@ func (s *Service) queryPartyBTxStatus(ctx context.Context, txID string) *SignRes
 		Reason: statusResp.Reason,
 	}
 	if signedTx != nil {
-		result.SignedTx = base64.StdEncoding.EncodeToString(signedTx)
+		result.SignedTx = "0x" + hex.EncodeToString(signedTx)
 		if statusResp.Status == string(store.TxStatusSigned) {
 			s.escalation.Delete(txID)
 		}

@@ -140,6 +140,8 @@ func (a *Adapter) AssembleSignedTx(unsignedTx []byte, sig *tss.Signature) ([]byt
 
 	// Build 65-byte signature: R (32 bytes) || S (32 bytes) || V (1 byte).
 	// R and S must be zero-padded to 32 bytes each.
+	// V is the recovery ID (0 or 1) from tss-lib; go-ethereum's WithSignature
+	// converts it to EIP-155 format (chainId*2 + 35 + V) internally.
 	sigBytes := make([]byte, 65)
 	rBytes := sig.R.Bytes()
 	sBytes := sig.S.Bytes()

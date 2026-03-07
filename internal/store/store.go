@@ -33,6 +33,9 @@ type KeyStore interface {
 
 	// UpdateLabel updates the label for a derived key.
 	UpdateLabel(ctx context.Context, derivationPath string, label string) error
+
+	// ClearDerivedKeys removes all derived keys (used when master keys change).
+	ClearDerivedKeys(ctx context.Context) error
 }
 
 // TxStore manages transaction history.
