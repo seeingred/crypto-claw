@@ -20,6 +20,9 @@ const (
 	MsgSignResponse MessageType = 0x11 // Sign response from Party B to Party A
 	MsgDeriveReq    MessageType = 0x12 // Derive key request
 	MsgDeriveResp   MessageType = 0x13 // Derive key response
+	MsgTxStatusReq  MessageType = 0x14 // Transaction status query
+	MsgTxStatusResp MessageType = 0x15 // Transaction status response
+	MsgSignApproved MessageType = 0x16 // Async escalation approved (Party B → Party A)
 	MsgHealthCheck  MessageType = 0x20 // Health check ping
 	MsgHealthResp   MessageType = 0x21 // Health check response
 )
@@ -91,7 +94,8 @@ type SignRequestPayload struct {
 	Value          string   `json:"value,omitempty"`
 	Data           string   `json:"data,omitempty"` // hex calldata
 	DerivationPath string   `json:"derivationPath"`
-	UnsignedTx     string   `json:"unsignedTx"` // base64
+	UnsignedTx     string   `json:"unsignedTx"`     // base64 raw unsigned tx
+	SignableBytes  string   `json:"signableBytes"`   // base64 hash/bytes to sign (both parties must agree)
 }
 
 // SignResponsePayload is the JSON payload for MsgSignResponse.
@@ -99,4 +103,19 @@ type SignResponsePayload struct {
 	Decision string `json:"decision"` // "approve", "reject", "escalate"
 	Reason   string `json:"reason"`
 	TxID     string `json:"txId,omitempty"` // set if escalated
+}
+
+// SignApprovedPayload is sent by Party B to Party A when an escalated tx is approved via Telegram.
+// This triggers Party A to start its side of the TSS signing protocol.
+type SignApprovedPayload struct {
+	TxID           string `json:"txId"`
+	DerivationPath string `json:"derivationPath"`
+}
+
+// TxStatusResponsePayload is the JSON payload for MsgTxStatusResp.
+type TxStatusResponsePayload struct {
+	TxID     string `json:"txId"`
+	Status   string `json:"status"`   // "pending", "signed", "rejected"
+	Reason   string `json:"reason,omitempty"`
+	SignedTx string `json:"signedTx,omitempty"` // base64-encoded signature
 }

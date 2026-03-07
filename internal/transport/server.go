@@ -8,7 +8,44 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+
+	"github.com/seeingred/crypto-claw/internal/tss"
 )
+
+// ServerRouter wraps a Server to implement tss.MessageRouter for Party B's TSS operations.
+type ServerRouter struct {
+	server *Server
+	inCh   chan tss.IncomingMessage
+}
+
+// NewServerRouter creates a new server-side TSS message router.
+func NewServerRouter(server *Server) *ServerRouter {
+	return &ServerRouter{
+		server: server,
+		inCh:   make(chan tss.IncomingMessage, 100),
+	}
+}
+
+// Send implements tss.MessageRouter by writing MsgTSSRound to the connected client.
+func (r *ServerRouter) Send(ctx context.Context, to tss.PartyID, msg []byte) error {
+	return r.server.Send(&Message{
+		Type:    MsgTSSRound,
+		Payload: msg,
+	})
+}
+
+// Receive implements tss.MessageRouter by returning the incoming message channel.
+func (r *ServerRouter) Receive() <-chan tss.IncomingMessage {
+	return r.inCh
+}
+
+// FeedMessage pushes an incoming TSS message from Party A into the router.
+func (r *ServerRouter) FeedMessage(from tss.PartyID, payload []byte) {
+	r.inCh <- tss.IncomingMessage{From: from, Payload: payload}
+}
+
+// Ensure ServerRouter implements tss.MessageRouter.
+var _ tss.MessageRouter = (*ServerRouter)(nil)
 
 // Server is an mTLS TCP server (Party B side).
 type Server struct {
@@ -21,6 +58,7 @@ type Server struct {
 	handler  MessageHandler
 	done     chan struct{}
 	started  bool
+	writeMu  sync.Mutex // protects concurrent writes to conn
 }
 
 // MessageHandler processes incoming messages and optionally returns a response.
@@ -151,7 +189,10 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 
 		if resp != nil {
 			resp.ID = msg.ID // Preserve correlation ID.
-			if err := WriteMessage(conn, resp); err != nil {
+			s.writeMu.Lock()
+			err := WriteMessage(conn, resp)
+			s.writeMu.Unlock()
+			if err != nil {
 				slog.Error("write response error", "error", err)
 				return
 			}
@@ -168,6 +209,8 @@ func (s *Server) Send(msg *Message) error {
 	if conn == nil {
 		return fmt.Errorf("no client connected")
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	return WriteMessage(conn, msg)
 }
 

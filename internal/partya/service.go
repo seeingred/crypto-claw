@@ -25,6 +25,7 @@ type TransportClient interface {
 type Service struct {
 	store      store.Store
 	transport  TransportClient
+	tssRouter  tss.MessageRouter // TSS message router (transport client)
 	tssProto   tss.Protocol
 	vmRegistry *vm.Registry
 	escalation *EscalationQueue
@@ -35,12 +36,14 @@ type Service struct {
 func NewService(
 	st store.Store,
 	tc TransportClient,
+	router tss.MessageRouter,
 	proto tss.Protocol,
 	registry *vm.Registry,
 ) *Service {
 	return &Service{
 		store:      st,
 		transport:  tc,
+		tssRouter:  router,
 		tssProto:   proto,
 		vmRegistry: registry,
 		escalation: NewEscalationQueue(),
@@ -163,6 +166,12 @@ func (s *Service) Sign(ctx context.Context, req *SignRequest) (*SignResult, erro
 		return nil, fmt.Errorf("build unsigned tx: %w", err)
 	}
 
+	// Extract signable bytes (the hash that both parties must sign).
+	signableBytes, err := adapter.ExtractSignableBytes(unsignedTx.RawBytes)
+	if err != nil {
+		return nil, fmt.Errorf("extract signable bytes: %w", err)
+	}
+
 	// Send sign request to Party B
 	payload := transport.SignRequestPayload{
 		To:             req.To,
@@ -170,6 +179,7 @@ func (s *Service) Sign(ctx context.Context, req *SignRequest) (*SignResult, erro
 		Data:           fmt.Sprintf("%x", req.Data),
 		DerivationPath: req.DerivationPath,
 		UnsignedTx:     base64.StdEncoding.EncodeToString(unsignedTx.RawBytes),
+		SignableBytes:  base64.StdEncoding.EncodeToString(signableBytes),
 	}
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
@@ -192,18 +202,15 @@ func (s *Service) Sign(ctx context.Context, req *SignRequest) (*SignResult, erro
 
 	switch signResp.Decision {
 	case "approve":
-		// Party B approved - proceed with TSS signing
-		signableBytes, err := adapter.ExtractSignableBytes(unsignedTx.RawBytes)
+		// Party B approved — run TSS signing (Party B is also running its side).
+		signedTx, err := s.runTSSSigning(ctx, adapter, derivedKey, unsignedTx)
 		if err != nil {
-			return nil, fmt.Errorf("extract signable bytes: %w", err)
+			return nil, fmt.Errorf("TSS signing: %w", err)
 		}
-
-		// For now, the TSS signing would happen here via the protocol
-		_ = signableBytes
 
 		return &SignResult{
 			Status:   "signed",
-			SignedTx: base64.StdEncoding.EncodeToString(unsignedTx.RawBytes),
+			SignedTx: base64.StdEncoding.EncodeToString(signedTx),
 			Reason:   signResp.Reason,
 		}, nil
 
@@ -216,7 +223,7 @@ func (s *Service) Sign(ctx context.Context, req *SignRequest) (*SignResult, erro
 	case "escalate":
 		// Store as pending for human review
 		txID := signResp.TxID
-		s.escalation.Add(txID, signResp.Reason)
+		s.escalation.Add(txID, signResp.Reason, unsignedTx.RawBytes)
 
 		// Persist to store
 		txRecord := &store.TxRecord{
@@ -245,10 +252,86 @@ func (s *Service) Sign(ctx context.Context, req *SignRequest) (*SignResult, erro
 	}
 }
 
+// runTSSSigning executes the TSS signing protocol with Party B and assembles the signed tx.
+func (s *Service) runTSSSigning(ctx context.Context, adapter vm.Adapter, derivedKey *store.DerivedKeyRecord, unsignedTx *vm.UnsignedTx) ([]byte, error) {
+	signableBytes, err := adapter.ExtractSignableBytes(unsignedTx.RawBytes)
+	if err != nil {
+		return nil, fmt.Errorf("extract signable bytes: %w", err)
+	}
+
+	signReq := tss.SignRequest{
+		DerivationPath: derivedKey.DerivationPath,
+		Message:        signableBytes,
+		Curve:          derivedKey.Curve,
+	}
+
+	parties := []tss.PartyID{
+		{ID: "party-a", Index: 0},
+		{ID: "party-b", Index: 1},
+	}
+	partyID := tss.PartyID{ID: "party-a", Index: 0}
+
+	sig, err := s.tssProto.Sign(ctx, signReq, derivedKey.Share, partyID, parties, s.tssRouter)
+	if err != nil {
+		return nil, fmt.Errorf("TSS sign: %w", err)
+	}
+
+	signedTx, err := adapter.AssembleSignedTx(unsignedTx.RawBytes, sig)
+	if err != nil {
+		return nil, fmt.Errorf("assemble signed tx: %w", err)
+	}
+
+	return signedTx, nil
+}
+
+// HandleSignApproved is called when Party B pushes a MsgSignApproved notification
+// after the user approves an escalated transaction via Telegram.
+func (s *Service) HandleSignApproved(ctx context.Context, txID, derivationPath string) {
+	// Look up the pending tx.
+	pending, ok := s.escalation.Get(txID)
+	if !ok {
+		return
+	}
+
+	// Look up adapter and key.
+	adapter, ok := s.vmRegistry.ForPath(derivationPath)
+	if !ok {
+		s.escalation.Update(txID, store.TxStatusRejected, nil)
+		return
+	}
+
+	derivedKey, err := s.store.GetDerivedKey(ctx, derivationPath)
+	if err != nil {
+		s.escalation.Update(txID, store.TxStatusRejected, nil)
+		return
+	}
+
+	unsignedTx := &vm.UnsignedTx{RawBytes: pending.UnsignedTx}
+
+	// Run TSS signing (Party B is also running its side).
+	signedTx, err := s.runTSSSigning(ctx, adapter, derivedKey, unsignedTx)
+	if err != nil {
+		s.escalation.Update(txID, store.TxStatusRejected, nil)
+		return
+	}
+
+	s.escalation.Update(txID, store.TxStatusSigned, signedTx)
+
+	// Also persist to store.
+	_ = s.store.UpdateTxStatus(ctx, txID, store.TxStatusSigned, signedTx)
+}
+
 // GetSignStatus retrieves the status of an escalated transaction.
 func (s *Service) GetSignStatus(ctx context.Context, txID string) (*SignResult, error) {
 	// Check in-memory queue first
 	if pending, ok := s.escalation.Get(txID); ok {
+		// If still pending, query Party B for the latest status.
+		if pending.Status == store.TxStatusPending {
+			if updated := s.queryPartyBTxStatus(ctx, txID); updated != nil {
+				return updated, nil
+			}
+		}
+
 		result := &SignResult{
 			TxID:   txID,
 			Status: string(pending.Status),
@@ -256,7 +339,6 @@ func (s *Service) GetSignStatus(ctx context.Context, txID string) (*SignResult, 
 		}
 		if pending.SignedTx != nil {
 			result.SignedTx = base64.StdEncoding.EncodeToString(pending.SignedTx)
-			// Remove from queue after retrieval if signed
 			if pending.Status == store.TxStatusSigned {
 				s.escalation.Delete(txID)
 			}
@@ -277,12 +359,53 @@ func (s *Service) GetSignStatus(ctx context.Context, txID string) (*SignResult, 
 	}
 	if txRecord.SignedTx != nil {
 		result.SignedTx = base64.StdEncoding.EncodeToString(txRecord.SignedTx)
-		// Delete from store after retrieval if signed
 		if txRecord.Status == store.TxStatusSigned {
 			_ = s.store.DeleteTx(ctx, txID)
 		}
 	}
 	return result, nil
+}
+
+// queryPartyBTxStatus queries Party B for the latest status of an escalated transaction.
+func (s *Service) queryPartyBTxStatus(ctx context.Context, txID string) *SignResult {
+	reqPayload, _ := json.Marshal(map[string]string{"txId": txID})
+	resp, err := s.transport.SendAndReceive(ctx, &transport.Message{
+		Type:    transport.MsgTxStatusReq,
+		ID:      s.nextMsgID(),
+		Payload: reqPayload,
+	})
+	if err != nil {
+		return nil
+	}
+
+	var statusResp transport.TxStatusResponsePayload
+	if err := json.Unmarshal(resp.Payload, &statusResp); err != nil {
+		return nil
+	}
+
+	if statusResp.Status == "unknown" {
+		return nil
+	}
+
+	// Update the in-memory escalation queue with Party B's status.
+	var signedTx []byte
+	if statusResp.SignedTx != "" {
+		signedTx, _ = base64.StdEncoding.DecodeString(statusResp.SignedTx)
+	}
+	s.escalation.Update(txID, store.TxStatus(statusResp.Status), signedTx)
+
+	result := &SignResult{
+		TxID:   txID,
+		Status: statusResp.Status,
+		Reason: statusResp.Reason,
+	}
+	if signedTx != nil {
+		result.SignedTx = base64.StdEncoding.EncodeToString(signedTx)
+		if statusResp.Status == string(store.TxStatusSigned) {
+			s.escalation.Delete(txID)
+		}
+	}
+	return result
 }
 
 // KeyInfo holds information about a derived key.

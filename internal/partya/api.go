@@ -186,26 +186,55 @@ func (h *apiHandler) handleAPIDocs(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(apiDocsMarkdown))
 }
 
-const apiDocsMarkdown = `# Crypto Claw — Party A API Reference
+const apiDocsMarkdown = `# Crypto Claw — MPC-TSS Signing Service
 
-Base URL: ` + "`http://localhost:8080`" + `
+You are interacting with Crypto Claw, an MPC-TSS signing service running on localhost.
+This service holds one share of a 2-of-2 threshold signature scheme. It cannot sign
+transactions alone — every signing request is forwarded to a secure co-signer (Party B)
+that runs an AI-powered transaction analyzer. Transactions may be auto-approved,
+rejected, or escalated to the owner for manual approval via Telegram.
+
+**You (the bot) are responsible for**: constructing transaction parameters, calling the
+signing API, handling pending/escalated states, and broadcasting signed transactions
+to the blockchain. This service handles key derivation, TSS signing, and returns the
+signed transaction bytes.
+
+Base URL: http://localhost:8080
+
+---
+
+## Quick Start
+
+1. Check connectivity: GET /health
+2. Derive a wallet: POST /derive with a BIP-44 path
+3. Fund the wallet address on-chain
+4. Sign a transaction: POST /sign
+5. If status is "pending_review", poll GET /sign/{txId} until resolved
+6. Broadcast the signed transaction to the chain RPC
+
+---
 
 ## Endpoints
 
 ### GET /health
 
-Check service health and connectivity to Party B.
+Check service health and connectivity to the secure co-signer.
 
 **Response:**
 ` + "```json" + `
 {"status": "ok", "secureServerConnected": true}
 ` + "```" + `
 
+Always check health before starting operations. If secureServerConnected is false,
+signing will fail.
+
 ---
 
 ### POST /derive
 
 Derive a new wallet address from the master key using a BIP-44 derivation path.
+Each unique path produces a unique address. Derivation is deterministic — the same
+path always produces the same address.
 
 **Request:**
 ` + "```json" + `
@@ -217,8 +246,8 @@ Derive a new wallet address from the master key using a BIP-44 derivation path.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| derivationPath | string | yes | BIP-44 path. Use coin type 60 for EVM, 501 for Solana |
-| label | string | no | Human-readable label for the derived key |
+| derivationPath | string | yes | BIP-44 path (see derivation paths below) |
+| label | string | no | Human-readable name for this wallet |
 
 **Response:**
 ` + "```json" + `
@@ -229,13 +258,28 @@ Derive a new wallet address from the master key using a BIP-44 derivation path.
 }
 ` + "```" + `
 
+**Derivation path format:** m/44'/{coin_type}'/{account}'/{change}/{index}
+
+| Chain | Coin Type | Example Path | Address Format |
+|-------|-----------|-------------|----------------|
+| Ethereum / EVM | 60 | m/44'/60'/0'/0/0 | 0x... (20 bytes) |
+| Solana | 501 | m/44'/501'/0'/0' | Base58 (32 bytes) |
+| Cosmos | 118 | m/44'/118'/0'/0/0 | cosmos1... (bech32) |
+
+To derive multiple wallets for the same chain, increment the last index:
+- m/44'/60'/0'/0/0 → first ETH wallet
+- m/44'/60'/0'/0/1 → second ETH wallet
+
 ---
 
 ### POST /sign
 
-Request a transaction signature. The transaction is analyzed by Party B's LLM-based
-TX analyzer before signing. If the analyzer flags the transaction, it is escalated
-to the authorized Telegram user for manual approval.
+Request a transaction to be signed. The transaction is sent to the secure co-signer
+for analysis before signing. There are three possible outcomes:
+
+1. **Approved** → signed transaction returned immediately (HTTP 200)
+2. **Pending review** → escalated to owner via Telegram (HTTP 202). Poll /sign/{txId}
+3. **Rejected** → transaction denied by the analyzer (HTTP 200, status: "rejected")
 
 **Request:**
 ` + "```json" + `
@@ -255,19 +299,19 @@ to the authorized Telegram user for manual approval.
 |-------|------|----------|-------------|
 | derivationPath | string | yes | BIP-44 path of the signing key |
 | to | string[] | yes | Recipient address(es) |
-| value | string | no | Value in smallest unit (wei for EVM) |
-| data | string | no | Hex-encoded calldata |
-| chainId | string | no | Chain ID for EVM transactions |
+| value | string | no | Value in smallest unit (wei for EVM, lamports for SOL) |
+| data | string | no | Hex-encoded calldata (0x prefix optional) |
+| chainId | string | no | Chain ID (1=Ethereum, 56=BSC, 137=Polygon, etc.) |
 | gasLimit | number | no | Gas limit |
-| gasPrice | string | no | Gas price in smallest unit |
-| nonce | number | no | Transaction nonce |
+| gasPrice | string | no | Gas price in wei |
+| nonce | number | no | Transaction nonce (fetch from chain if unsure) |
 
-**Response (approved):** HTTP 200
+**Response (signed):** HTTP 200
 ` + "```json" + `
 {
   "txId": "uuid",
   "status": "signed",
-  "signature": "0x..."
+  "signedTx": "0x..."
 }
 ` + "```" + `
 
@@ -280,6 +324,22 @@ to the authorized Telegram user for manual approval.
 }
 ` + "```" + `
 
+**Response (rejected):** HTTP 200
+` + "```json" + `
+{
+  "txId": "uuid",
+  "status": "rejected",
+  "reason": "Transaction to unverified contract"
+}
+` + "```" + `
+
+**When you receive "pending_review":**
+- Save the txId
+- Poll GET /sign/{txId} periodically (every 5-10 seconds)
+- The owner will approve or reject via Telegram
+- Once approved, the response will include the signedTx
+- Default timeout is 5 minutes — if the owner doesn't respond, status becomes "rejected"
+
 ---
 
 ### GET /sign/{txId}
@@ -290,16 +350,24 @@ Check the status of a previously submitted signing request.
 ` + "```json" + `
 {
   "txId": "uuid",
-  "status": "signed|pending_review|rejected",
-  "signature": "0x..."
+  "status": "signed",
+  "signedTx": "0x..."
 }
 ` + "```" + `
+
+Possible status values:
+- "signed" — approved and signed, signedTx contains the signed transaction bytes
+- "pending_review" — waiting for owner approval via Telegram
+- "rejected" — denied by analyzer or owner
+
+**Important:** Once you retrieve a signed transaction, it is deleted from memory.
+Store it on your side if you need it later.
 
 ---
 
 ### GET /keys
 
-List all derived keys.
+List all derived keys and their addresses.
 
 **Response:**
 ` + "```json" + `
@@ -314,6 +382,8 @@ List all derived keys.
   }
 }
 ` + "```" + `
+
+Use this to check what wallets have already been derived before creating new ones.
 
 ---
 
@@ -333,19 +403,45 @@ Update the label of a derived key.
 
 ---
 
-## Common derivation paths
+## Error Handling
 
-| Chain | Coin Type | Example Path |
-|-------|-----------|-------------|
-| Ethereum / EVM | 60 | m/44'/60'/0'/0/0 |
-| Solana | 501 | m/44'/501'/0'/0' |
-| Cosmos | 118 | m/44'/118'/0'/0/0 |
-
-## Error format
-
-All errors return:
+All errors return JSON:
 ` + "```json" + `
 {"error": "description of what went wrong"}
+` + "```" + `
+
+Common errors:
+- 400: Invalid request (missing fields, bad derivation path)
+- 404: Transaction ID not found
+- 500: Internal error (check /health for connectivity issues)
+- 503: Secure co-signer not connected (secureServerConnected: false)
+
+---
+
+## Signing Flow Summary
+
+` + "```" + `
+Bot                    Party A (this API)           Party B (secure co-signer)
+ |                          |                              |
+ |-- POST /sign ----------->|                              |
+ |                          |-- forwards tx for analysis ->|
+ |                          |                              |-- TX analyzer runs
+ |                          |                              |-- Decision: approve/reject/escalate
+ |                          |<-- decision ----------------|
+ |                          |                              |
+ | If approved:             |                              |
+ |<-- {status: "signed"} ---|                              |
+ |                          |                              |
+ | If escalated:            |                              |
+ |<-- {status: "pending_review", txId} -|                  |
+ |                          |           |-- Telegram notification to owner
+ |-- GET /sign/{txId} ----->|           |
+ |<-- {status: "pending_review"} -------|
+ |   ... poll ...           |           |-- Owner approves via Telegram
+ |-- GET /sign/{txId} ----->|           |
+ |<-- {status: "signed", signedTx} ----|
+ |                          |                              |
+ | Bot broadcasts signedTx to blockchain RPC               |
 ` + "```" + `
 `
 

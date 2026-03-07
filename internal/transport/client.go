@@ -36,6 +36,7 @@ type Client struct {
 	// Pending response channels for request/reply.
 	pending   map[uint64]chan *Message
 	pendingMu sync.Mutex
+	writeMu   sync.Mutex // protects concurrent writes to conn
 }
 
 // NewClient creates a new mTLS client.
@@ -203,6 +204,8 @@ func (c *Client) SendMessage(msg *Message) error {
 	if conn == nil {
 		return fmt.Errorf("not connected")
 	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	return WriteMessage(conn, msg)
 }
 

@@ -152,9 +152,23 @@ func formatTxNotification(txID string, req transport.SignRequestPayload, reason 
 	}
 	sb.WriteString(fmt.Sprintf("*Path:* %s\n", req.DerivationPath))
 	if reason != "" {
-		sb.WriteString(fmt.Sprintf("\n*Analyzer:* %s\n", reason))
+		sb.WriteString(fmt.Sprintf("\n*Analyzer:* %s\n", escapeMD(reason)))
 	}
 	return sb.String()
+}
+
+// escapeMD escapes characters that break Telegram Markdown V1 parsing.
+func escapeMD(s string) string {
+	replacer := strings.NewReplacer(
+		"`", "'",
+		"*", "",
+		"_", " ",
+		"[", "(",
+		"]", ")",
+		"{", "(",
+		"}", ")",
+	)
+	return replacer.Replace(s)
 }
 
 func toggleLabel(current string) string {

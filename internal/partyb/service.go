@@ -19,6 +19,14 @@ import (
 	"github.com/seeingred/crypto-claw/internal/tss"
 )
 
+// SigningStartedCallback is called when Party B starts TSS signing (approve or escalation-approve).
+// The caller (main.go) uses this to set up the ServerRouter and wire TSS round messages.
+type SigningStartedCallback func(txID string, req transport.SignRequestPayload) *transport.ServerRouter
+
+// EscalationApprovedCallback is called when an escalated tx is approved via Telegram.
+// Party B pushes MsgSignApproved to Party A so Party A starts its side of signing.
+type EscalationApprovedCallback func(txID string, derivationPath string)
+
 // Service is the Party B orchestration service.
 type Service struct {
 	cfg       *config.Config
@@ -28,6 +36,10 @@ type Service struct {
 	bot       *telegram.Bot
 	logger    *slog.Logger
 
+	// Callbacks set by the main wiring code.
+	onSigningStarted      SigningStartedCallback
+	onEscalationApproved  EscalationApprovedCallback
+
 	// Pending escalations awaiting human decision.
 	pending   map[string]chan bool
 	pendingMu sync.Mutex
@@ -35,12 +47,15 @@ type Service struct {
 	// Cached sign requests for escalated transactions.
 	reqCache   map[string]*signContext
 	reqCacheMu sync.Mutex
+
+	// Active TSS signing router (one signing session at a time).
+	activeRouter   *transport.ServerRouter
+	activeRouterMu sync.Mutex
 }
 
 // signContext holds the context for an in-flight sign request.
 type signContext struct {
-	req       transport.SignRequestPayload
-	messageID uint64
+	req transport.SignRequestPayload
 }
 
 // New creates a new Party B service.
@@ -70,6 +85,16 @@ func New(cfg *config.Config, st store.Store, proto tss.Protocol, logger *slog.Lo
 	return svc, nil
 }
 
+// SetSigningStartedCallback sets the callback for when TSS signing begins.
+func (s *Service) SetSigningStartedCallback(cb SigningStartedCallback) {
+	s.onSigningStarted = cb
+}
+
+// SetEscalationApprovedCallback sets the callback for when an escalated tx is approved.
+func (s *Service) SetEscalationApprovedCallback(cb EscalationApprovedCallback) {
+	s.onEscalationApproved = cb
+}
+
 // Start starts the Telegram bot in the background.
 func (s *Service) Start(ctx context.Context) {
 	if s.bot != nil {
@@ -84,8 +109,21 @@ func (s *Service) Stop() {
 	}
 }
 
+// HandleTSSRound routes an incoming TSS round message to the active signing session.
+func (s *Service) HandleTSSRound(from tss.PartyID, payload []byte) {
+	s.activeRouterMu.Lock()
+	router := s.activeRouter
+	s.activeRouterMu.Unlock()
+
+	if router != nil {
+		router.FeedMessage(from, payload)
+	} else {
+		s.logger.Warn("received TSS round message but no active signing session")
+	}
+}
+
 // HandleSignRequest is the main entry point for incoming sign requests.
-// It runs the analyzer, decides, and returns a response.
+// It runs the analyzer, returns the decision, and starts TSS signing if approved.
 func (s *Service) HandleSignRequest(ctx context.Context, msgID uint64, req transport.SignRequestPayload) transport.SignResponsePayload {
 	txID := uuid.New().String()
 	s.logger.Info("received sign request", "txID", txID, "to", req.To, "path", req.DerivationPath)
@@ -112,84 +150,16 @@ func (s *Service) HandleSignRequest(ctx context.Context, msgID uint64, req trans
 	decision := s.analyzer.Analyze(ctx, req)
 	s.logger.Info("analyzer decision", "txID", txID, "action", decision.Action, "confidence", decision.Confidence, "reason", decision.Reason)
 
-	// If bot is in auto mode and decision is approve/reject, act immediately.
+	// Determine action.
+	shouldEscalate := decision.Action == analyzer.ActionEscalate || (s.bot != nil && !s.bot.AutoMode())
 	if s.bot != nil && s.bot.AutoMode() && decision.Action != analyzer.ActionEscalate {
-		return s.finalizeDecision(ctx, txID, req, decision)
+		shouldEscalate = false
 	}
 
-	// If decision is escalate, or we're in manual mode, notify via Telegram.
-	if decision.Action == analyzer.ActionEscalate || (s.bot != nil && !s.bot.AutoMode()) {
+	if shouldEscalate {
 		return s.escalate(ctx, txID, req, decision.Reason)
 	}
 
-	return s.finalizeDecision(ctx, txID, req, decision)
-}
-
-// escalate sends a notification to Telegram and waits for human decision.
-func (s *Service) escalate(ctx context.Context, txID string, req transport.SignRequestPayload, reason string) transport.SignResponsePayload {
-	decisionCh := make(chan bool, 1)
-
-	s.pendingMu.Lock()
-	s.pending[txID] = decisionCh
-	s.pendingMu.Unlock()
-
-	s.reqCacheMu.Lock()
-	s.reqCache[txID] = &signContext{req: req}
-	s.reqCacheMu.Unlock()
-
-	defer func() {
-		s.pendingMu.Lock()
-		delete(s.pending, txID)
-		s.pendingMu.Unlock()
-		s.reqCacheMu.Lock()
-		delete(s.reqCache, txID)
-		s.reqCacheMu.Unlock()
-	}()
-
-	// Notify via Telegram.
-	if s.bot != nil {
-		if err := s.bot.NotifyTransaction(txID, req, reason); err != nil {
-			s.logger.Error("failed to send telegram notification", "err", err)
-		}
-	}
-
-	// Wait for human decision or timeout.
-	timeout := s.cfg.Telegram.EscalationTimeout
-	if timeout == 0 {
-		timeout = 5 * time.Minute
-	}
-
-	select {
-	case approved := <-decisionCh:
-		if approved {
-			return s.finalizeDecision(ctx, txID, req, analyzer.Decision{
-				Action:     analyzer.ActionApprove,
-				Reason:     "manually approved via Telegram",
-				Confidence: 1.0,
-			})
-		}
-		s.updateTxStatus(ctx, txID, store.TxStatusRejected)
-		return transport.SignResponsePayload{
-			Decision: string(analyzer.ActionReject),
-			Reason:   "manually rejected via Telegram",
-		}
-	case <-time.After(timeout):
-		s.updateTxStatus(ctx, txID, store.TxStatusRejected)
-		return transport.SignResponsePayload{
-			Decision: string(analyzer.ActionReject),
-			Reason:   "escalation timed out",
-		}
-	case <-ctx.Done():
-		s.updateTxStatus(ctx, txID, store.TxStatusRejected)
-		return transport.SignResponsePayload{
-			Decision: string(analyzer.ActionReject),
-			Reason:   "request cancelled",
-		}
-	}
-}
-
-// finalizeDecision handles the final approve/reject flow.
-func (s *Service) finalizeDecision(ctx context.Context, txID string, req transport.SignRequestPayload, decision analyzer.Decision) transport.SignResponsePayload {
 	if decision.Action == analyzer.ActionReject {
 		s.updateTxStatus(ctx, txID, store.TxStatusRejected)
 		return transport.SignResponsePayload{
@@ -198,37 +168,136 @@ func (s *Service) finalizeDecision(ctx context.Context, txID string, req transpo
 		}
 	}
 
-	// Approved - participate in TSS signing.
+	// Approved — start TSS signing in background (Party A will also start after receiving "approve").
 	s.updateTxStatus(ctx, txID, store.TxStatusApproved)
+	s.startSigning(txID, req)
 
-	sig, err := s.sign(ctx, req)
-	if err != nil {
-		s.logger.Error("signing failed", "txID", txID, "err", err)
-		return transport.SignResponsePayload{
-			Decision: string(analyzer.ActionReject),
-			Reason:   fmt.Sprintf("signing failed: %v", err),
-		}
-	}
-
-	s.updateTxStatus(ctx, txID, store.TxStatusSigned)
-
-	sigJSON, _ := json.Marshal(sig)
 	return transport.SignResponsePayload{
 		Decision: string(analyzer.ActionApprove),
 		Reason:   decision.Reason,
-		TxID:     base64.StdEncoding.EncodeToString(sigJSON),
 	}
 }
 
-// sign performs the TSS signing operation.
-func (s *Service) sign(ctx context.Context, req transport.SignRequestPayload) (*tss.Signature, error) {
-	// Decode the unsigned transaction.
-	msgBytes, err := base64.StdEncoding.DecodeString(req.UnsignedTx)
-	if err != nil {
-		return nil, fmt.Errorf("decode unsigned tx: %w", err)
+// startSigning begins the TSS signing protocol for Party B in a background goroutine.
+func (s *Service) startSigning(txID string, req transport.SignRequestPayload) {
+	if s.onSigningStarted == nil {
+		s.logger.Error("no signing started callback configured", "txID", txID)
+		return
 	}
 
-	// Retrieve key share for derivation path.
+	router := s.onSigningStarted(txID, req)
+	s.activeRouterMu.Lock()
+	s.activeRouter = router
+	s.activeRouterMu.Unlock()
+
+	go func() {
+		defer func() {
+			s.activeRouterMu.Lock()
+			if s.activeRouter == router {
+				s.activeRouter = nil
+			}
+			s.activeRouterMu.Unlock()
+		}()
+
+		sig, err := s.sign(context.Background(), req, router)
+		if err != nil {
+			s.logger.Error("TSS signing failed", "txID", txID, "err", err)
+			s.updateTxStatus(context.Background(), txID, store.TxStatusRejected)
+			return
+		}
+
+		sigJSON, _ := json.Marshal(sig)
+		if err := s.store.UpdateTxStatus(context.Background(), txID, store.TxStatusSigned, sigJSON); err != nil {
+			s.logger.Error("failed to store signed tx", "txID", txID, "err", err)
+		}
+		s.logger.Info("TSS signing completed", "txID", txID)
+	}()
+}
+
+// escalate sends a notification to Telegram and returns immediately with "escalate" status.
+func (s *Service) escalate(ctx context.Context, txID string, req transport.SignRequestPayload, reason string) transport.SignResponsePayload {
+	if s.bot != nil {
+		if err := s.bot.NotifyTransaction(txID, req, reason); err != nil {
+			s.logger.Error("failed to send telegram notification", "err", err)
+			s.updateTxStatus(ctx, txID, store.TxStatusRejected)
+			return transport.SignResponsePayload{
+				Decision: string(analyzer.ActionReject),
+				Reason:   fmt.Sprintf("failed to send Telegram notification: %v", err),
+			}
+		}
+	} else {
+		s.updateTxStatus(ctx, txID, store.TxStatusRejected)
+		return transport.SignResponsePayload{
+			Decision: string(analyzer.ActionReject),
+			Reason:   "no Telegram bot configured for escalation",
+		}
+	}
+
+	// Register pending decision handler.
+	decisionCh := make(chan bool, 1)
+	s.pendingMu.Lock()
+	s.pending[txID] = decisionCh
+	s.pendingMu.Unlock()
+
+	s.reqCacheMu.Lock()
+	s.reqCache[txID] = &signContext{req: req}
+	s.reqCacheMu.Unlock()
+
+	// Handle the decision asynchronously.
+	go func() {
+		timeout := s.cfg.Telegram.EscalationTimeout
+		if timeout == 0 {
+			timeout = 5 * time.Minute
+		}
+
+		defer func() {
+			s.pendingMu.Lock()
+			delete(s.pending, txID)
+			s.pendingMu.Unlock()
+			s.reqCacheMu.Lock()
+			delete(s.reqCache, txID)
+			s.reqCacheMu.Unlock()
+		}()
+
+		select {
+		case approved := <-decisionCh:
+			if approved {
+				s.logger.Info("tx approved via Telegram", "txID", txID)
+				s.updateTxStatus(context.Background(), txID, store.TxStatusApproved)
+
+				// Notify Party A to start its side of signing.
+				if s.onEscalationApproved != nil {
+					s.onEscalationApproved(txID, req.DerivationPath)
+				}
+
+				// Start Party B's side of signing.
+				s.startSigning(txID, req)
+			} else {
+				s.logger.Info("tx rejected via Telegram", "txID", txID)
+				s.updateTxStatus(context.Background(), txID, store.TxStatusRejected)
+			}
+		case <-time.After(timeout):
+			s.logger.Warn("escalation timed out", "txID", txID)
+			s.updateTxStatus(context.Background(), txID, store.TxStatusRejected)
+		}
+	}()
+
+	return transport.SignResponsePayload{
+		Decision: string(analyzer.ActionEscalate),
+		TxID:     txID,
+		Reason:   reason,
+	}
+}
+
+// sign performs the TSS signing operation using the provided router.
+func (s *Service) sign(ctx context.Context, req transport.SignRequestPayload, router tss.MessageRouter) (*tss.Signature, error) {
+	// Use the pre-computed signable bytes (hash) that Party A extracted.
+	// Both parties MUST sign the same bytes for TSS to produce a valid signature.
+	msgBytes, err := base64.StdEncoding.DecodeString(req.SignableBytes)
+	if err != nil {
+		return nil, fmt.Errorf("decode signable bytes: %w", err)
+	}
+
 	derivedKey, err := s.store.GetDerivedKey(ctx, req.DerivationPath)
 	if err != nil {
 		return nil, fmt.Errorf("get derived key: %w", err)
@@ -246,7 +315,7 @@ func (s *Service) sign(ctx context.Context, req transport.SignRequestPayload) (*
 	}
 	partyID := tss.PartyID{ID: "party-b", Index: 1}
 
-	return s.tss.Sign(ctx, signReq, derivedKey.Share, partyID, parties, nil)
+	return s.tss.Sign(ctx, signReq, derivedKey.Share, partyID, parties, router)
 }
 
 // onTelegramDecision is the callback from the Telegram bot.
@@ -262,7 +331,47 @@ func (s *Service) onTelegramDecision(txID string, approved bool) {
 	}
 }
 
-// updateTxStatus updates a transaction's status in the store.
+// GetTxStatus returns the current status of a transaction.
+func (s *Service) GetTxStatus(ctx context.Context, txID string) (*store.TxRecord, error) {
+	return s.store.GetTx(ctx, txID)
+}
+
+// HandleDeriveRequest derives a child key share and stores it locally.
+func (s *Service) HandleDeriveRequest(ctx context.Context, derivationPath string) error {
+	curve := tss.CurveSecp256k1
+	if isSolanePath(derivationPath) {
+		curve = tss.CurveEd25519
+	}
+
+	masterShare, err := s.store.GetMasterShare(ctx, curve)
+	if err != nil {
+		return fmt.Errorf("get master share: %w", err)
+	}
+
+	derived, err := s.tss.DeriveKey(ctx, masterShare, derivationPath)
+	if err != nil {
+		return fmt.Errorf("derive key: %w", err)
+	}
+
+	record := &store.DerivedKeyRecord{
+		DerivationPath: derivationPath,
+		Curve:          curve,
+		PublicKey:       derived.PublicKey,
+		Share:           derived.Share,
+		CreatedAt:       time.Now(),
+	}
+	if err := s.store.SaveDerivedKey(ctx, record); err != nil {
+		return fmt.Errorf("save derived key: %w", err)
+	}
+
+	s.logger.Info("derived key for path", "path", derivationPath, "curve", curve)
+	return nil
+}
+
+func isSolanePath(path string) bool {
+	return len(path) > 7 && (path[5:8] == "501" || (len(path) > 8 && path[5:9] == "501'"))
+}
+
 func (s *Service) updateTxStatus(ctx context.Context, txID string, status store.TxStatus) {
 	if err := s.store.UpdateTxStatus(ctx, txID, status, nil); err != nil {
 		s.logger.Error("failed to update tx status", "txID", txID, "status", status, "err", err)

@@ -8,11 +8,11 @@ import (
 
 // PendingTx represents an escalated transaction awaiting human review.
 type PendingTx struct {
-	TxID   string         `json:"txId"`
-	Status store.TxStatus `json:"status"`
-	Reason string         `json:"reason,omitempty"`
-	// SignedTx holds the signed transaction bytes once approved and signed.
-	SignedTx []byte `json:"signedTx,omitempty"`
+	TxID       string         `json:"txId"`
+	Status     store.TxStatus `json:"status"`
+	Reason     string         `json:"reason,omitempty"`
+	UnsignedTx []byte         `json:"-"`              // raw unsigned tx for TSS signing on approval
+	SignedTx   []byte         `json:"signedTx,omitempty"`
 }
 
 // EscalationQueue manages in-memory pending escalated transactions.
@@ -29,13 +29,14 @@ func NewEscalationQueue() *EscalationQueue {
 }
 
 // Add adds a new pending transaction to the queue.
-func (q *EscalationQueue) Add(txID, reason string) {
+func (q *EscalationQueue) Add(txID, reason string, unsignedTx []byte) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.pending[txID] = &PendingTx{
-		TxID:   txID,
-		Status: store.TxStatusPending,
-		Reason: reason,
+		TxID:       txID,
+		Status:     store.TxStatusPending,
+		Reason:     reason,
+		UnsignedTx: unsignedTx,
 	}
 }
 

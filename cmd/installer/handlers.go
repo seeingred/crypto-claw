@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -177,6 +178,16 @@ func handleLLMSave(state *WizardState) http.HandlerFunc {
 		if req.Provider == "" {
 			writeError(w, http.StatusBadRequest, "provider is required")
 			return
+		}
+
+		// Auto-detect provider from API key format if there's a mismatch.
+		if req.APIKey != "" {
+			detected := detectLLMProvider(req.APIKey)
+			if detected != "" && detected != req.Provider {
+				slog.Warn("API key format doesn't match selected provider, auto-correcting",
+					"selected", req.Provider, "detected", detected)
+				req.Provider = detected
+			}
 		}
 
 		state.mu.Lock()
@@ -675,5 +686,17 @@ func handleLocalhostSetup(state *WizardState) http.HandlerFunc {
 		slog.Info("localhost mode enabled", "partyAAddr", req.PartyAAddr)
 
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	}
+}
+
+// detectLLMProvider guesses the provider from the API key format.
+func detectLLMProvider(apiKey string) string {
+	switch {
+	case strings.HasPrefix(apiKey, "sk-ant-"):
+		return "anthropic"
+	case strings.HasPrefix(apiKey, "sk-proj-") || strings.HasPrefix(apiKey, "sk-or-"):
+		return "openai"
+	default:
+		return "" // unknown — trust user selection
 	}
 }

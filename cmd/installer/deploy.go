@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/seeingred/crypto-claw/internal/config"
+	"github.com/seeingred/crypto-claw/internal/store"
 	"github.com/seeingred/crypto-claw/internal/tss"
 )
 
@@ -270,6 +272,16 @@ func DeployLocal(state *WizardState, logFn func(string)) error {
 		return fmt.Errorf("postgres setup: %w", err)
 	}
 
+	// Import key shares into PostgreSQL for each party.
+	logFn("[local] Importing key shares into databases...")
+	for _, party := range []string{"a", "b"} {
+		partyDir := filepath.Join(baseDir, "party-"+party)
+		cfg := buildPartyConfig(state, party, partyDir)
+		if err := importSharesToDB(cfg.Database.DSN(), partyDir, logFn, party); err != nil {
+			return fmt.Errorf("import shares for party %s: %w", party, err)
+		}
+	}
+
 	// In local mode, start processes directly.
 	logFn("[local] Starting Party B...")
 	partyBDir := filepath.Join(baseDir, "party-b")
@@ -336,6 +348,46 @@ func DeployLocal(state *WizardState, logFn func(string)) error {
 
 	logFn("[local] Local deployment complete.")
 	logFn(fmt.Sprintf("[local] Config directory: %s", baseDir))
+	return nil
+}
+
+// importSharesToDB reads key share JSON files from disk and imports them into the party's PostgreSQL database.
+func importSharesToDB(dsn string, partyDir string, logFn func(string), party string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	st, err := store.NewPostgresStore(ctx, dsn, "") // no passphrase for local dev
+	if err != nil {
+		return fmt.Errorf("connect to database: %w", err)
+	}
+	defer st.Close()
+
+	// Import ECDSA share.
+	ecdsaPath := filepath.Join(partyDir, "ecdsa_share.json")
+	if data, err := os.ReadFile(ecdsaPath); err == nil {
+		var share tss.KeyShare
+		if err := json.Unmarshal(data, &share); err != nil {
+			return fmt.Errorf("parse ECDSA share: %w", err)
+		}
+		if err := st.SaveMasterShare(ctx, &share); err != nil {
+			return fmt.Errorf("save ECDSA share: %w", err)
+		}
+		logFn(fmt.Sprintf("[%s] ECDSA master share imported.", party))
+	}
+
+	// Import EdDSA share.
+	eddsaPath := filepath.Join(partyDir, "eddsa_share.json")
+	if data, err := os.ReadFile(eddsaPath); err == nil {
+		var share tss.KeyShare
+		if err := json.Unmarshal(data, &share); err != nil {
+			return fmt.Errorf("parse EdDSA share: %w", err)
+		}
+		if err := st.SaveMasterShare(ctx, &share); err != nil {
+			return fmt.Errorf("save EdDSA share: %w", err)
+		}
+		logFn(fmt.Sprintf("[%s] EdDSA master share imported.", party))
+	}
+
 	return nil
 }
 

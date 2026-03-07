@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -72,11 +73,30 @@ func main() {
 		registry.Register([]string{"118"}, tendermint.New(chain.Prefix, chain.Denom))
 	}
 
-	// Create transport adapter that wraps Client to match the Service's TransportClient interface.
+	// Create transport adapter.
 	tc := &transportAdapter{client: client}
 
-	// Initialize service.
-	svc := partya.NewService(st, tc, proto, registry)
+	// Initialize service with transport client as TSS router.
+	svc := partya.NewService(st, tc, client, proto, registry)
+
+	// Handle incoming push messages from Party B (MsgSignApproved).
+	client.SetHandler(func(msg *transport.Message) (*transport.Message, error) {
+		switch msg.Type {
+		case transport.MsgSignApproved:
+			var payload transport.SignApprovedPayload
+			if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+				slog.Error("unmarshal sign-approved", "err", err)
+				return nil, nil
+			}
+			slog.Info("received sign-approved from Party B", "txID", payload.TxID)
+			// Run signing in a goroutine so the readLoop isn't blocked.
+			go svc.HandleSignApproved(context.Background(), payload.TxID, payload.DerivationPath)
+			return nil, nil
+		default:
+			slog.Warn("unhandled push message", "type", msg.Type)
+			return nil, nil
+		}
+	})
 
 	// Start HTTP server.
 	router := partya.NewRouter(svc)

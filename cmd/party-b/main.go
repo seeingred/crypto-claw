@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -59,6 +60,26 @@ func main() {
 	}
 	server := transport.NewServer(cfg.Transport.ListenAddr, tlsCfg)
 
+	// Wire up callbacks: when Party B starts signing, create a ServerRouter.
+	svc.SetSigningStartedCallback(func(txID string, req transport.SignRequestPayload) *transport.ServerRouter {
+		logger.Info("creating TSS router for signing", "txID", txID)
+		return transport.NewServerRouter(server)
+	})
+
+	// Wire up callback: when escalated tx is approved, push MsgSignApproved to Party A.
+	svc.SetEscalationApprovedCallback(func(txID string, derivationPath string) {
+		payload, _ := json.Marshal(transport.SignApprovedPayload{
+			TxID:           txID,
+			DerivationPath: derivationPath,
+		})
+		if err := server.Send(&transport.Message{
+			Type:    transport.MsgSignApproved,
+			Payload: payload,
+		}); err != nil {
+			logger.Error("failed to push sign-approved to Party A", "txID", txID, "err", err)
+		}
+	})
+
 	// Set handler for incoming messages.
 	server.SetHandler(func(msg *transport.Message) (*transport.Message, error) {
 		switch msg.Type {
@@ -80,6 +101,11 @@ func main() {
 				Payload: respBytes,
 			}, nil
 
+		case transport.MsgTSSRound:
+			// Route TSS round messages to the active signing session.
+			svc.HandleTSSRound(tss.PartyID{ID: "party-a", Index: 0}, msg.Payload)
+			return nil, nil // no response for TSS rounds
+
 		case transport.MsgHealthCheck:
 			return &transport.Message{
 				Type:    transport.MsgHealthResp,
@@ -88,12 +114,63 @@ func main() {
 			}, nil
 
 		case transport.MsgDeriveReq:
-			// Party B also derives the key for its share.
-			logger.Info("derive request received", "payload", string(msg.Payload))
+			var deriveReq struct {
+				DerivationPath string `json:"derivationPath"`
+			}
+			if err := json.Unmarshal(msg.Payload, &deriveReq); err != nil {
+				return nil, fmt.Errorf("unmarshal derive request: %w", err)
+			}
+
+			if err := svc.HandleDeriveRequest(ctx, deriveReq.DerivationPath); err != nil {
+				logger.Error("derive failed", "path", deriveReq.DerivationPath, "error", err)
+				errResp, _ := json.Marshal(map[string]string{"status": "error", "error": err.Error()})
+				return &transport.Message{
+					Type:    transport.MsgDeriveResp,
+					ID:      msg.ID,
+					Payload: errResp,
+				}, nil
+			}
+
 			return &transport.Message{
 				Type:    transport.MsgDeriveResp,
 				ID:      msg.ID,
 				Payload: []byte(`{"status":"ok"}`),
+			}, nil
+
+		case transport.MsgTxStatusReq:
+			var statusReq struct {
+				TxID string `json:"txId"`
+			}
+			if err := json.Unmarshal(msg.Payload, &statusReq); err != nil {
+				return nil, fmt.Errorf("unmarshal tx status request: %w", err)
+			}
+
+			txRecord, err := svc.GetTxStatus(ctx, statusReq.TxID)
+			if err != nil {
+				errResp, _ := json.Marshal(transport.TxStatusResponsePayload{
+					TxID:   statusReq.TxID,
+					Status: "unknown",
+				})
+				return &transport.Message{
+					Type:    transport.MsgTxStatusResp,
+					ID:      msg.ID,
+					Payload: errResp,
+				}, nil
+			}
+
+			resp := transport.TxStatusResponsePayload{
+				TxID:   txRecord.ID,
+				Status: string(txRecord.Status),
+				Reason: txRecord.Reason,
+			}
+			if txRecord.SignedTx != nil {
+				resp.SignedTx = base64.StdEncoding.EncodeToString(txRecord.SignedTx)
+			}
+			respBytes, _ := json.Marshal(resp)
+			return &transport.Message{
+				Type:    transport.MsgTxStatusResp,
+				ID:      msg.ID,
+				Payload: respBytes,
 			}, nil
 
 		default:
