@@ -18,6 +18,9 @@ type WizardState struct {
 	// Current wizard step.
 	Step string `json:"step"`
 
+	// Installer mode: "install" (new), "restore" (from mnemonic), "update" (code only).
+	Mode string `json:"mode"`
+
 	// Server configuration for SSH deployment.
 	ServerA   SSHConfig `json:"serverA"`
 	ServerB   SSHConfig `json:"serverB"`
@@ -75,6 +78,7 @@ func (s *WizardState) SanitizedState() map[string]any {
 
 	return map[string]any{
 		"step":      s.Step,
+		"mode":      s.Mode,
 		"localMode": s.LocalMode,
 		"serverA": map[string]any{
 			"host":       s.ServerA.Host,

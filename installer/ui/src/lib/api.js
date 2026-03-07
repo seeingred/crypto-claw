@@ -57,6 +57,19 @@ export async function installPrepare() {
   });
 }
 
+export async function installRestore(mnemonic) {
+  return request('/install/restore', {
+    method: 'POST',
+    body: JSON.stringify({ mnemonic }),
+  });
+}
+
+export async function startUpdate() {
+  return request('/update', {
+    method: 'POST',
+  });
+}
+
 export async function saveLLMConfig(config) {
   return request('/llm/save', {
     method: 'POST',

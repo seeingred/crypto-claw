@@ -7,6 +7,7 @@
   import { installPrepare, startDeployment, subscribeDeployLogs, verifyTelegram } from '../api.js';
 
   // Phases: generating → mnemonic → telegram → deploying → done → error
+  // In restore mode: skip generating/mnemonic, go straight to telegram.
   let phase = $state('generating');
   let mnemonic = $state('');
   let mnemonicWords = $derived(mnemonic ? mnemonic.split(' ') : []);
@@ -20,6 +21,7 @@
   let logContainer = $state(null);
   let unsubscribeLogs = null;
   let unsubscribeStore = null;
+  let isRestore = $state(false);
 
   // Telegram verification state.
   let state = $state({});
@@ -31,7 +33,15 @@
   onMount(async () => {
     wizardState.subscribe((s) => (state = s));
     unsubscribeStore = deployLogs.subscribe((l) => (logs = l));
-    await generateKeys();
+
+    // Check if we're in restore mode (mnemonic already submitted on Welcome page).
+    if (state.installMode === 'restore') {
+      isRestore = true;
+      phase = 'telegram';
+      startTelegramVerify();
+    } else {
+      await generateKeys();
+    }
   });
 
   onDestroy(() => {
@@ -78,7 +88,7 @@
     telegramVerifying = false;
   }
 
-  // Estimate progress from log messages (backend sends ~10-15 log lines total).
+  // Estimate progress from log messages.
   let logCount = 0;
   const EXPECTED_LOG_COUNT = 12;
 
@@ -115,7 +125,6 @@
         return;
       }
 
-      // Log message — update progress estimate.
       logCount++;
       progress = Math.min(95, Math.round((logCount / EXPECTED_LOG_COUNT) * 100));
       addLog(data.message || JSON.stringify(data));
@@ -174,7 +183,7 @@
     </div>
 
   {:else if phase === 'mnemonic'}
-    <!-- Show mnemonic for backup -->
+    <!-- Show mnemonic for backup (new install only) -->
     <div class="text-center mb-8">
       <h2 class="text-3xl font-bold text-gray-900 dark:text-white mb-2">
         Save Your Recovery Phrase
@@ -187,8 +196,7 @@
     <Alert variant="warning" title="Critical: Save This Now">
       <p>
         This recovery phrase will <strong>not</strong> be shown again.
-        It allows you to recover your wallet in Trust Wallet or any BIP-39
-        compatible wallet if both servers are lost.
+        It allows you to restore your wallet if both servers are lost.
       </p>
     </Alert>
 
@@ -312,7 +320,7 @@
     </Card>
 
     <div class="flex justify-between mt-8">
-      <Button variant="ghost" onclick={() => { phase = 'mnemonic'; errorMsg = ''; }}>
+      <Button variant="ghost" onclick={handleBack}>
         <svg class="w-4 h-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
           <path stroke-linecap="round" stroke-linejoin="round" d="M11 17l-5-5m0 0l5-5m-5 5h12" />
         </svg>
@@ -419,7 +427,6 @@
       <p>{errorMsg || 'An unexpected error occurred.'}</p>
     </Alert>
 
-    <!-- Show logs if we have them -->
     {#if logs.length > 0}
       <div class="mt-4 bg-gray-900 dark:bg-black rounded-xl border border-gray-700 overflow-hidden">
         <div class="flex items-center gap-2 px-4 py-2.5 bg-gray-800 dark:bg-gray-900 border-b border-gray-700">
@@ -440,27 +447,6 @@
         </div>
       </div>
     {/if}
-
-    <Card title="Troubleshooting">
-      <ul class="space-y-2 text-sm text-gray-600 dark:text-gray-400">
-        <li class="flex items-start gap-2">
-          <span class="text-gray-400 mt-0.5">•</span>
-          <span><strong>SSH auth error:</strong> Verify that your server credentials (password or SSH key) are correct on the Servers step.</span>
-        </li>
-        <li class="flex items-start gap-2">
-          <span class="text-gray-400 mt-0.5">•</span>
-          <span><strong>Connection refused:</strong> Ensure the servers are reachable and SSH is running on the configured port.</span>
-        </li>
-        <li class="flex items-start gap-2">
-          <span class="text-gray-400 mt-0.5">•</span>
-          <span><strong>Docker errors:</strong> The installer requires Docker on the remote servers. Check that Docker can be installed or is already present.</span>
-        </li>
-        <li class="flex items-start gap-2">
-          <span class="text-gray-400 mt-0.5">•</span>
-          <span><strong>Permission denied:</strong> The SSH user needs sudo privileges to install Docker and write to /etc/crypto-claw.</span>
-        </li>
-      </ul>
-    </Card>
 
     <div class="flex justify-between mt-8">
       <Button variant="ghost" onclick={handleBack}>

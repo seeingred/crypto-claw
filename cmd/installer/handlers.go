@@ -27,7 +27,9 @@ func registerAPIRoutes(mux *http.ServeMux, state *WizardState) {
 	mux.HandleFunc("POST /api/telegram/save", handleTelegramSave(state))
 	mux.HandleFunc("POST /api/telegram/verify", handleTelegramVerify(state))
 	mux.HandleFunc("POST /api/install/prepare", handleInstallPrepare(state))
+	mux.HandleFunc("POST /api/install/restore", handleInstallRestore(state))
 	mux.HandleFunc("POST /api/deploy", handleDeploy(state))
+	mux.HandleFunc("POST /api/update", handleUpdate(state))
 	mux.HandleFunc("GET /api/deploy/logs", handleDeployLogs(state))
 	mux.HandleFunc("GET /api/state", handleState(state))
 	mux.HandleFunc("POST /api/localhost/setup", handleLocalhostSetup(state))
@@ -145,6 +147,7 @@ func handleInstallPrepare(state *WizardState) http.HandlerFunc {
 		state.ECDSAPubKey = hex.EncodeToString(keys.ECDSAPubKey)
 		state.EdDSAPubKey = hex.EncodeToString(keys.EdDSAPubKey)
 		state.Step = "prepared"
+		state.Mode = "install"
 		state.mu.Unlock()
 
 		slog.Info("mnemonic generated, keys derived",
@@ -155,6 +158,50 @@ func handleInstallPrepare(state *WizardState) http.HandlerFunc {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"status":      "ok",
 			"mnemonic":    keys.Mnemonic,
+			"ecdsaPubKey": state.ECDSAPubKey,
+			"eddsaPubKey": state.EdDSAPubKey,
+		})
+	}
+}
+
+// handleInstallRestore restores keys from an existing BIP-39 mnemonic.
+func handleInstallRestore(state *WizardState) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Mnemonic string `json:"mnemonic"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+			return
+		}
+
+		req.Mnemonic = strings.TrimSpace(req.Mnemonic)
+		if req.Mnemonic == "" {
+			writeError(w, http.StatusBadRequest, "mnemonic is required")
+			return
+		}
+
+		keys, err := DeriveKeysFromMnemonic(req.Mnemonic)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid mnemonic: "+err.Error())
+			return
+		}
+
+		state.mu.Lock()
+		state.Mnemonic = keys.Mnemonic
+		state.ECDSAPubKey = hex.EncodeToString(keys.ECDSAPubKey)
+		state.EdDSAPubKey = hex.EncodeToString(keys.EdDSAPubKey)
+		state.Step = "prepared"
+		state.Mode = "restore"
+		state.mu.Unlock()
+
+		slog.Info("wallet restored from mnemonic",
+			"ecdsaPub", state.ECDSAPubKey[:16]+"...",
+			"eddsaPub", state.EdDSAPubKey[:16]+"...",
+		)
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":      "ok",
 			"ecdsaPubKey": state.ECDSAPubKey,
 			"eddsaPubKey": state.EdDSAPubKey,
 		})
@@ -481,6 +528,70 @@ func handleDeploy(state *WizardState) http.HandlerFunc {
 				logFn("Deployment finished successfully.")
 			} else {
 				logFn("Deployment finished with errors.")
+			}
+		}()
+
+		writeJSON(w, http.StatusOK, map[string]string{"status": "started"})
+	}
+}
+
+// handleUpdate redeploys code without regenerating keys, certs, or config.
+// It reuses the existing installation and only restarts processes.
+func handleUpdate(state *WizardState) http.HandlerFunc {
+	var updating sync.Mutex
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !updating.TryLock() {
+			writeError(w, http.StatusConflict, "update already in progress")
+			return
+		}
+
+		state.mu.Lock()
+		state.DeployDone = false
+		state.DeployFailed = false
+		state.DeployLogs = nil
+		state.Mode = "update"
+		state.Step = "deploying"
+		localMode := state.LocalMode
+		state.mu.Unlock()
+
+		logFn := func(msg string) {
+			slog.Info(msg)
+			state.AppendLog(msg)
+		}
+
+		go func() {
+			defer updating.Unlock()
+			failed := false
+
+			fail := func(msg string) {
+				logFn(msg)
+				failed = true
+			}
+
+			if localMode {
+				logFn("Starting local update (code only)...")
+				if err := UpdateLocal(logFn); err != nil {
+					fail(fmt.Sprintf("ERROR: local update failed: %v", err))
+				}
+			} else {
+				fail("ERROR: remote update not yet implemented — use deploy for remote servers")
+			}
+
+			state.mu.Lock()
+			state.DeployDone = true
+			state.DeployFailed = failed
+			if !failed {
+				state.Step = "done"
+			} else {
+				state.Step = "deploying"
+			}
+			state.mu.Unlock()
+
+			if !failed {
+				logFn("Update finished successfully.")
+			} else {
+				logFn("Update finished with errors.")
 			}
 		}()
 

@@ -351,6 +351,91 @@ func DeployLocal(state *WizardState, logFn func(string)) error {
 	return nil
 }
 
+// UpdateLocal restarts both parties locally without regenerating keys or config.
+// It rebuilds and restarts processes using the existing config directory.
+func UpdateLocal(logFn func(string)) error {
+	baseDir := filepath.Join(os.TempDir(), "crypto-claw-local")
+
+	// Verify config exists from a previous install.
+	for _, party := range []string{"a", "b"} {
+		cfgPath := filepath.Join(baseDir, "party-"+party, "config.json")
+		if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
+			return fmt.Errorf("no existing installation found at %s — run install or restore first", cfgPath)
+		}
+	}
+
+	// Kill existing processes.
+	logFn("[update] Stopping existing party processes...")
+	killExistingParties(logFn)
+
+	// Start Party B.
+	logFn("[update] Starting Party B...")
+	partyBDir := filepath.Join(baseDir, "party-b")
+	cmdB := exec.Command("go", "run", "./cmd/party-b", "-config", filepath.Join(partyBDir, "config.json"))
+	cmdB.Dir = findProjectRoot()
+	cmdB.Stdout = os.Stdout
+	cmdB.Stderr = os.Stderr
+	if err := cmdB.Start(); err != nil {
+		logFn(fmt.Sprintf("[update] WARNING: Could not start Party B: %v", err))
+		logFn("[update] Start manually: go run ./cmd/party-b -config " + filepath.Join(partyBDir, "config.json"))
+	} else {
+		logFn(fmt.Sprintf("[update] Party B started (PID %d)", cmdB.Process.Pid))
+	}
+
+	// Start Party A.
+	logFn("[update] Starting Party A...")
+	partyADir := filepath.Join(baseDir, "party-a")
+	cmdA := exec.Command("go", "run", "./cmd/party-a", "-config", filepath.Join(partyADir, "config.json"))
+	cmdA.Dir = findProjectRoot()
+	cmdA.Stdout = os.Stdout
+	cmdA.Stderr = os.Stderr
+	if err := cmdA.Start(); err != nil {
+		logFn(fmt.Sprintf("[update] WARNING: Could not start Party A: %v", err))
+		logFn("[update] Start manually: go run ./cmd/party-a -config " + filepath.Join(partyADir, "config.json"))
+	} else {
+		logFn(fmt.Sprintf("[update] Party A started (PID %d)", cmdA.Process.Pid))
+	}
+
+	// Verify processes stay alive.
+	waitExit := func(cmd *exec.Cmd, name string) <-chan error {
+		ch := make(chan error, 1)
+		if cmd == nil || cmd.Process == nil {
+			ch <- fmt.Errorf("%s was not started", name)
+			return ch
+		}
+		go func() { ch <- cmd.Wait() }()
+		return ch
+	}
+	exitB := waitExit(cmdB, "Party B")
+	exitA := waitExit(cmdA, "Party A")
+
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	var procErrors []string
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-exitB:
+			exitB = nil
+			procErrors = append(procErrors, fmt.Sprintf("Party B exited early: %v", err))
+		case err := <-exitA:
+			exitA = nil
+			procErrors = append(procErrors, fmt.Sprintf("Party A exited early: %v", err))
+		case <-timer.C:
+			i = 2
+		}
+	}
+	if len(procErrors) > 0 {
+		for _, e := range procErrors {
+			logFn(fmt.Sprintf("[update] ERROR: %s", e))
+		}
+		return fmt.Errorf("processes failed to stay running: %s", strings.Join(procErrors, "; "))
+	}
+
+	logFn("[update] Local update complete.")
+	logFn(fmt.Sprintf("[update] Config directory: %s", baseDir))
+	return nil
+}
+
 // importSharesToDB reads key share JSON files from disk and imports them into the party's PostgreSQL database.
 // If master keys change, all derived keys are cleared to prevent address mismatches.
 func importSharesToDB(dsn string, partyDir string, logFn func(string), party string) error {
