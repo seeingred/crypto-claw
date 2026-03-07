@@ -3,6 +3,7 @@ package solana
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,7 +15,6 @@ import (
 
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/programs/system"
-	"github.com/gagliardetto/solana-go/programs/token"
 
 	"github.com/seeingred/crypto-claw/internal/tss"
 	"github.com/seeingred/crypto-claw/internal/vm"
@@ -50,7 +50,7 @@ type txEnvelope struct {
 }
 
 // BuildUnsignedTx constructs a Solana transaction for SOL or SPL token transfers.
-func (a *Adapter) BuildUnsignedTx(_ context.Context, req *vm.TxRequest) (*vm.UnsignedTx, error) {
+func (a *Adapter) BuildUnsignedTx(ctx context.Context, req *vm.TxRequest) (*vm.UnsignedTx, error) {
 	if len(req.To) == 0 {
 		return nil, fmt.Errorf("solana: at least one recipient required")
 	}
@@ -67,21 +67,56 @@ func (a *Adapter) BuildUnsignedTx(_ context.Context, req *vm.TxRequest) (*vm.Uns
 
 	var instructions []solana.Instruction
 
-	if len(req.Data) > 0 {
-		// SPL token transfer: Data contains the mint address as raw bytes (base58 encoded in the envelope).
-		mint := solana.PublicKeyFromBytes(req.Data[:32])
-		fromATA, _, err := solana.FindAssociatedTokenAddress(from, mint)
+	if req.Mint != "" {
+		// SPL token transfer: detect token program (legacy vs Token-2022) via RPC.
+		mint := solana.MustPublicKeyFromBase58(req.Mint)
+
+		tokenProgramID := solana.TokenProgramID // default to legacy
+		if req.RpcURL != "" {
+			detected, err := detectTokenProgram(ctx, req.RpcURL, mint)
+			if err != nil {
+				return nil, fmt.Errorf("solana: detect token program: %w", err)
+			}
+			tokenProgramID = detected
+		}
+
+		fromATA, _, err := findATA(from, mint, tokenProgramID)
 		if err != nil {
 			return nil, fmt.Errorf("solana: find from ATA: %w", err)
 		}
-		toATA, _, err := solana.FindAssociatedTokenAddress(to, mint)
+		toATA, _, err := findATA(to, mint, tokenProgramID)
 		if err != nil {
 			return nil, fmt.Errorf("solana: find to ATA: %w", err)
 		}
 
-		instructions = append(instructions,
-			token.NewTransferInstruction(amount, fromATA, toATA, from, nil).Build(),
-		)
+		// Create recipient ATA if it doesn't exist (idempotent).
+		// Instruction discriminator 1 = CreateIdempotent.
+		instructions = append(instructions, solana.NewInstruction(
+			solana.SPLAssociatedTokenAccountProgramID,
+			[]*solana.AccountMeta{
+				{PublicKey: from, IsSigner: true, IsWritable: true},
+				{PublicKey: toATA, IsSigner: false, IsWritable: true},
+				{PublicKey: to, IsSigner: false, IsWritable: false},
+				{PublicKey: mint, IsSigner: false, IsWritable: false},
+				{PublicKey: solana.SystemProgramID, IsSigner: false, IsWritable: false},
+				{PublicKey: tokenProgramID, IsSigner: false, IsWritable: false},
+			},
+			[]byte{1}, // CreateIdempotent
+		))
+
+		// SPL Transfer: discriminator 3 + uint64 amount (little-endian).
+		transferData := make([]byte, 9)
+		transferData[0] = 3
+		binary.LittleEndian.PutUint64(transferData[1:], amount)
+		instructions = append(instructions, solana.NewInstruction(
+			tokenProgramID,
+			[]*solana.AccountMeta{
+				{PublicKey: fromATA, IsSigner: false, IsWritable: true},
+				{PublicKey: toATA, IsSigner: false, IsWritable: true},
+				{PublicKey: from, IsSigner: true, IsWritable: false},
+			},
+			transferData,
+		))
 	} else {
 		// Simple SOL transfer
 		instructions = append(instructions,
@@ -302,3 +337,61 @@ func isPrivateIP(ip net.IP) bool {
 // allowLocalRPC controls whether local/private IPs are allowed for RPC.
 // Set via ALLOW_LOCAL_RPC=1 environment variable for dev/testing.
 var allowLocalRPC = os.Getenv("ALLOW_LOCAL_RPC") == "1"
+
+// findATA derives the Associated Token Account for a wallet+mint using the given token program.
+func findATA(wallet, mint, tokenProgramID solana.PublicKey) (solana.PublicKey, uint8, error) {
+	return solana.FindProgramAddress(
+		[][]byte{
+			wallet[:],
+			tokenProgramID[:],
+			mint[:],
+		},
+		solana.SPLAssociatedTokenAccountProgramID,
+	)
+}
+
+// detectTokenProgram queries the Solana RPC to determine which token program owns the mint.
+// Returns TokenProgramID or Token2022ProgramID.
+func detectTokenProgram(ctx context.Context, rpcURL string, mint solana.PublicKey) (solana.PublicKey, error) {
+	body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"getAccountInfo","params":["%s",{"encoding":"jsonParsed"}]}`, mint.String())
+
+	req, err := http.NewRequestWithContext(ctx, "POST", rpcURL, bytes.NewReader([]byte(body)))
+	if err != nil {
+		return solana.PublicKey{}, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return solana.PublicKey{}, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 8192))
+	if err != nil {
+		return solana.PublicKey{}, fmt.Errorf("read response: %w", err)
+	}
+
+	var rpcResp struct {
+		Result struct {
+			Value *struct {
+				Owner string `json:"owner"`
+			} `json:"value"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(respBody, &rpcResp); err != nil {
+		return solana.PublicKey{}, fmt.Errorf("parse response: %w", err)
+	}
+	if rpcResp.Result.Value == nil {
+		return solana.PublicKey{}, fmt.Errorf("mint account not found: %s", mint)
+	}
+
+	owner := rpcResp.Result.Value.Owner
+	switch owner {
+	case solana.Token2022ProgramID.String():
+		return solana.Token2022ProgramID, nil
+	default:
+		return solana.TokenProgramID, nil
+	}
+}

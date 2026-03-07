@@ -129,6 +129,7 @@ type SignRequest struct {
 	GasPrice        string   `json:"gasPrice,omitempty"`
 	Nonce           uint64   `json:"nonce,omitempty"`
 	RpcURL          string   `json:"rpcUrl,omitempty"`
+	Mint            string   `json:"mint,omitempty"`
 }
 
 // SignResult holds the result of a sign request.
@@ -164,6 +165,7 @@ func (s *Service) Sign(ctx context.Context, req *SignRequest) (*SignResult, erro
 		GasPrice:        req.GasPrice,
 		Nonce:           req.Nonce,
 		RpcURL:          req.RpcURL,
+		Mint:            req.Mint,
 	}
 	unsignedTx, err := adapter.BuildUnsignedTx(ctx, txReq)
 	if err != nil {

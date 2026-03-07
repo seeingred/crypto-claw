@@ -67,6 +67,7 @@ type signAPIRequest struct {
 	GasPrice        string   `json:"gasPrice,omitempty"`
 	Nonce           uint64   `json:"nonce,omitempty"`
 	RpcURL          string   `json:"rpcUrl,omitempty"` // Solana RPC URL for fetching blockhash at sign time
+	Mint            string   `json:"mint,omitempty"`   // Solana SPL token mint address (base58)
 }
 
 func (h *apiHandler) handleSign(w http.ResponseWriter, r *http.Request) {
@@ -105,6 +106,7 @@ func (h *apiHandler) handleSign(w http.ResponseWriter, r *http.Request) {
 		GasPrice:        req.GasPrice,
 		Nonce:           req.Nonce,
 		RpcURL:          req.RpcURL,
+		Mint:            req.Mint,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -294,7 +296,8 @@ are chain-specific and ignored by adapters that don't use them.
 | derivationPath | string | yes | BIP-44 path of the signing key |
 | to | string[] | yes | Recipient address(es) |
 | value | string | no | Value in smallest unit (wei, lamports, uatom) |
-| data | string | no | Hex-encoded calldata (EVM) or mint address (Solana SPL) |
+| data | string | no | Hex-encoded calldata (EVM only) |
+| mint | string | no | Solana SPL token mint address (base58) |
 | chainId | string | no | EVM chain ID (1=Ethereum, 56=BSC, 137=Polygon) or Cosmos chain ID |
 | gasLimit | number | no | EVM gas limit |
 | gasPrice | string | no | EVM gas price in wei |
@@ -324,6 +327,20 @@ are chain-specific and ignored by adapters that don't use them.
 }
 ` + "```" + `
 
+**Solana example** (SPL token transfer):
+` + "```json" + `
+{
+  "derivationPath": "m/44'/501'/0'/0'",
+  "to": ["RecipientBase58Address"],
+  "value": "1000000",
+  "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  "rpcUrl": "https://api.mainnet-beta.solana.com"
+}
+` + "```" + `
+
+The mint field is the SPL token mint address in base58.
+The service automatically resolves Associated Token Accounts (ATAs) for sender and recipient.
+
 **Cosmos example** (ATOM transfer):
 ` + "```json" + `
 {
@@ -337,7 +354,7 @@ are chain-specific and ignored by adapters that don't use them.
 **Notes:**
 - Solana: pass rpcUrl so the service fetches a fresh blockhash right before signing.
   This avoids blockhash expiry during Telegram approval flow (~60-90s validity).
-- Solana SPL: pass the mint address as hex in the data field.
+- Solana SPL: pass the token mint address in the mint field (base58).
 - EVM: if gasLimit/gasPrice/nonce are omitted, defaults are used. For production,
   fetch these from the chain RPC before signing.
 - signedTx is returned as 0x-prefixed hex for all chains.

@@ -45,6 +45,7 @@ type TxRequest struct {
 	Nonce           uint64 `json:"nonce,omitempty"`
 	AutoNonce       bool   `json:"autoNonce,omitempty"`       // fetch nonce from chain
 	RpcURL          string `json:"rpcUrl,omitempty"` // Solana RPC URL for fetching blockhash at sign time
+	Mint            string `json:"mint,omitempty"`   // Solana SPL token mint (base58)
 }
 
 // UnsignedTx wraps a constructed unsigned transaction.
