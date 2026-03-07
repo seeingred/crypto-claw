@@ -1,7 +1,7 @@
 <script>
   import Button from '../components/Button.svelte';
   import Card from '../components/Card.svelte';
-  import { wizardState } from '../stores.js';
+  import { currentStep, wizardState } from '../stores.js';
   import { onMount } from 'svelte';
 
   let state = $state({});
@@ -193,7 +193,16 @@
       </Card>
     </div>
 
-    <div class="flex justify-center mt-8">
+    <div class="flex justify-center gap-4 mt-8">
+      <Button
+        variant="ghost"
+        onclick={() => { currentStep.set(0); }}
+      >
+        <svg class="w-4 h-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M11 17l-5-5m0 0l5-5m-5 5h12" />
+        </svg>
+        Back to Welcome
+      </Button>
       <Button
         size="lg"
         onclick={() => {

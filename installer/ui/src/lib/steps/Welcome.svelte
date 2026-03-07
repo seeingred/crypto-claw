@@ -394,7 +394,13 @@
     </div>
 
     {#if mode === 'updateDone'}
-      <div class="flex justify-center mt-8">
+      <div class="flex justify-center gap-4 mt-8">
+        <Button variant="ghost" onclick={() => { mode = 'choose'; errorMsg = ''; }}>
+          <svg class="w-4 h-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M11 17l-5-5m0 0l5-5m-5 5h12" />
+          </svg>
+          Back to Menu
+        </Button>
         <Button size="lg" onclick={() => { if (typeof window !== 'undefined') window.close(); }}>
           Close Wizard
         </Button>
