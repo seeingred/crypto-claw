@@ -14,6 +14,7 @@ import (
 
 	"github.com/bnb-chain/tss-lib/v2/ecdsa/keygen"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/jackc/pgx/v5"
 	"golang.org/x/crypto/ssh"
 
 	"github.com/seeingred/crypto-claw/internal/tss"
@@ -28,6 +29,7 @@ func registerAPIRoutes(mux *http.ServeMux, state *WizardState) {
 	mux.HandleFunc("POST /api/telegram/verify", handleTelegramVerify(state))
 	mux.HandleFunc("POST /api/install/prepare", handleInstallPrepare(state))
 	mux.HandleFunc("POST /api/install/restore", handleInstallRestore(state))
+	mux.HandleFunc("POST /api/install/export", handleInstallExport(state))
 	mux.HandleFunc("POST /api/deploy", handleDeploy(state))
 	mux.HandleFunc("POST /api/update", handleUpdate(state))
 	mux.HandleFunc("GET /api/deploy/logs", handleDeployLogs(state))
@@ -206,6 +208,121 @@ func handleInstallRestore(state *WizardState) http.HandlerFunc {
 			"eddsaPubKey": state.EdDSAPubKey,
 		})
 	}
+}
+
+// handleInstallExport accepts a mnemonic and optional derivation paths.
+// It derives the exact private keys that TSS would have produced, allowing
+// disaster recovery: mnemonic + paths → private keys → import into MetaMask → move funds.
+func handleInstallExport(state *WizardState) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Mnemonic string   `json:"mnemonic"`
+			Paths    []string `json:"paths"` // e.g. ["m/44'/60'/0'/0/0", "m/44'/60'/0'/0/1"]
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+			return
+		}
+
+		req.Mnemonic = strings.TrimSpace(req.Mnemonic)
+		if req.Mnemonic == "" {
+			writeError(w, http.StatusBadRequest, "mnemonic is required")
+			return
+		}
+
+		// Validate mnemonic by deriving master keys.
+		keys, err := DeriveKeysFromMnemonic(req.Mnemonic)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid mnemonic: "+err.Error())
+			return
+		}
+
+		// Solana key (TSS doesn't derive EdDSA, so there's only one SOL address).
+		solPriv, solAddr, err := ExportSolanaKey(req.Mnemonic)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "derive Solana key: "+err.Error())
+			return
+		}
+
+		// Try to find derived paths from DB if no paths provided.
+		dbAddrs := listDerivedAddressesFromDB()
+		if len(req.Paths) == 0 && len(dbAddrs) > 0 {
+			for _, a := range dbAddrs {
+				if a["curve"] == "secp256k1" {
+					req.Paths = append(req.Paths, a["path"])
+				}
+			}
+		}
+
+		// Derive each requested ECDSA path using TSS-compatible derivation.
+		var derivedKeys []map[string]string
+		for _, path := range req.Paths {
+			exported, err := DeriveECDSAKeyTSS(req.Mnemonic, path)
+			if err != nil {
+				slog.Warn("export: failed to derive path", "path", path, "error", err)
+				derivedKeys = append(derivedKeys, map[string]string{
+					"path":  path,
+					"error": err.Error(),
+				})
+				continue
+			}
+			derivedKeys = append(derivedKeys, map[string]string{
+				"path":       exported.Path,
+				"privKeyHex": exported.PrivKeyHex,
+				"address":    exported.Address,
+			})
+		}
+
+		slog.Info("wallet keys exported",
+			"ecdsaMaster", hex.EncodeToString(keys.ECDSAPubKey[:8])+"...",
+			"solAddress", solAddr,
+			"derivedPaths", len(derivedKeys),
+		)
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":          "ok",
+			"solPrivKey":      solPriv,
+			"solAddress":      solAddr,
+			"derivedKeys":     derivedKeys,
+			"dbAddresses":     dbAddrs,
+		})
+	}
+}
+
+// listDerivedAddressesFromDB tries to connect to the local postgres and list derived keys.
+// Returns nil if DB is not available (best effort).
+func listDerivedAddressesFromDB() []map[string]string {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	connStr := "host=127.0.0.1 port=5432 user=crypto_claw password=crypto_claw dbname=crypto_claw_a sslmode=disable"
+	conn, err := pgx.Connect(ctx, connStr)
+	if err != nil {
+		slog.Debug("export: could not connect to local DB", "error", err)
+		return nil
+	}
+	defer conn.Close(ctx)
+
+	rows, err := conn.Query(ctx, "SELECT derivation_path, curve, address FROM derived_keys ORDER BY created_at")
+	if err != nil {
+		slog.Debug("export: could not query derived_keys", "error", err)
+		return nil
+	}
+	defer rows.Close()
+
+	var result []map[string]string
+	for rows.Next() {
+		var path, curve, address string
+		if err := rows.Scan(&path, &curve, &address); err != nil {
+			continue
+		}
+		result = append(result, map[string]string{
+			"path":    path,
+			"curve":   curve,
+			"address": address,
+		})
+	}
+	return result
 }
 
 // handleLLMSave saves the LLM provider configuration.

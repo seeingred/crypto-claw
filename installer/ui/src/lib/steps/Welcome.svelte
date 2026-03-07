@@ -3,15 +3,20 @@
   import Card from '../components/Card.svelte';
   import Alert from '../components/Alert.svelte';
   import { currentStep, wizardState, deployLogs } from '../stores.js';
-  import { installRestore, startUpdate, subscribeDeployLogs } from '../api.js';
+  import { installRestore, installExport, startUpdate, subscribeDeployLogs } from '../api.js';
 
-  let mode = $state('choose'); // choose | restore | updating | updateDone | updateError
+  let mode = $state('choose');
   let restoreMnemonic = $state('');
+  let exportMnemonic = $state('');
+  let exportPaths = $state('');
+  let exportResult = $state(null);
+  let derivingPath = $state('');
   let errorMsg = $state('');
   let logs = $state([]);
   let progress = $state(0);
   let logContainer = $state(null);
   let unsubscribeLogs = null;
+  let mnemonicValidated = $state(false);
 
   function handleNewInstall() {
     wizardState.update((s) => ({ ...s, installMode: 'install' }));
@@ -20,6 +25,96 @@
 
   function handleRestoreClick() {
     mode = 'restore';
+  }
+
+  function handleExportClick() {
+    mode = 'export';
+    mnemonicValidated = false;
+    exportResult = null;
+  }
+
+  async function submitExportMnemonic() {
+    const words = exportMnemonic.trim();
+    if (!words) {
+      errorMsg = 'Please enter your recovery phrase';
+      return;
+    }
+    const wordCount = words.split(/\s+/).length;
+    if (wordCount !== 24 && wordCount !== 12) {
+      errorMsg = `Recovery phrase should be 12 or 24 words (got ${wordCount})`;
+      return;
+    }
+    errorMsg = '';
+    mode = 'exporting';
+    try {
+      // Initial call with no paths — gets SOL key and DB addresses
+      const result = await installExport(words, []);
+      exportResult = result;
+      mnemonicValidated = true;
+      mode = 'exported';
+    } catch (err) {
+      errorMsg = err.message || 'Failed to export keys';
+      mode = 'export';
+    }
+  }
+
+  async function derivePath() {
+    const path = derivingPath.trim();
+    if (!path) return;
+    if (!path.startsWith('m/')) {
+      errorMsg = 'Path must start with m/ (e.g. m/44\'/60\'/0\'/0/0)';
+      return;
+    }
+    errorMsg = '';
+    try {
+      const result = await installExport(exportMnemonic.trim(), [path]);
+      if (result.derivedKeys?.length > 0) {
+        const newKey = result.derivedKeys[0];
+        if (newKey.error) {
+          errorMsg = `Failed to derive ${path}: ${newKey.error}`;
+          return;
+        }
+        // Add to existing results, avoid duplicates
+        const existing = exportResult.derivedKeys || [];
+        const alreadyExists = existing.some(k => k.path === newKey.path);
+        if (!alreadyExists) {
+          exportResult = {
+            ...exportResult,
+            derivedKeys: [...existing, newKey],
+          };
+        }
+      }
+      derivingPath = '';
+    } catch (err) {
+      errorMsg = err.message || 'Failed to derive path';
+    }
+  }
+
+  async function deriveAllDBPaths() {
+    if (!exportResult?.dbAddresses?.length) return;
+    const ecdsaPaths = exportResult.dbAddresses
+      .filter(a => a.curve === 'secp256k1')
+      .map(a => a.path);
+    if (ecdsaPaths.length === 0) return;
+    errorMsg = '';
+    try {
+      const result = await installExport(exportMnemonic.trim(), ecdsaPaths);
+      if (result.derivedKeys?.length > 0) {
+        const existing = exportResult.derivedKeys || [];
+        const existingPaths = new Set(existing.map(k => k.path));
+        const newKeys = result.derivedKeys.filter(k => !existingPaths.has(k.path));
+        exportResult = {
+          ...exportResult,
+          derivedKeys: [...existing, ...newKeys],
+        };
+      }
+    } catch (err) {
+      errorMsg = err.message || 'Failed to derive paths';
+    }
+  }
+
+  function copyToClipboard(text) {
+    navigator.clipboard.writeText(text);
   }
 
   async function submitRestore() {
@@ -42,7 +137,6 @@
         restoredEcdsaPub: result.ecdsaPubKey,
         restoredEddsaPub: result.eddsaPubKey,
       }));
-      // Skip to servers step (step 1)
       currentStep.update((n) => n + 1);
     } catch (err) {
       errorMsg = err.message || 'Failed to restore from recovery phrase';
@@ -130,7 +224,7 @@
       </p>
     </div>
 
-    <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
       <!-- New Install -->
       <button
         onclick={handleNewInstall}
@@ -159,7 +253,7 @@
         </div>
         <h3 class="text-lg font-semibold text-gray-900 dark:text-white mb-2">Restore</h3>
         <p class="text-sm text-gray-600 dark:text-gray-400">
-          Restore from an existing 24-word recovery phrase. All derived addresses will be recoverable.
+          Restore from an existing recovery phrase and redeploy fresh TSS shares on new servers.
         </p>
       </button>
 
@@ -176,6 +270,22 @@
         <h3 class="text-lg font-semibold text-gray-900 dark:text-white mb-2">Update</h3>
         <p class="text-sm text-gray-600 dark:text-gray-400">
           Redeploy with new code. Keeps existing keys, config, and certificates.
+        </p>
+      </button>
+
+      <!-- Disaster Recovery / Export -->
+      <button
+        onclick={handleExportClick}
+        class="text-left p-6 rounded-xl border-2 border-gray-200 dark:border-gray-700 hover:border-rose-500 dark:hover:border-rose-500 bg-white dark:bg-gray-800 transition-all hover:shadow-lg cursor-pointer"
+      >
+        <div class="inline-flex items-center justify-center w-12 h-12 rounded-full bg-rose-100 dark:bg-rose-900/50 mb-4">
+          <svg class="w-6 h-6 text-rose-600 dark:text-rose-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 5.25a3 3 0 013 3m3 0a6 6 0 01-7.029 5.912c-.563-.097-1.159.026-1.563.43L10.5 17.25H8.25v2.25H6v2.25H2.25v-2.818c0-.597.237-1.17.659-1.591l6.499-6.499c.404-.404.527-1 .43-1.563A6 6 0 1121.75 8.25z" />
+          </svg>
+        </div>
+        <h3 class="text-lg font-semibold text-gray-900 dark:text-white mb-2">Disaster Recovery</h3>
+        <p class="text-sm text-gray-600 dark:text-gray-400">
+          Lost both servers? Export private keys for any derivation path to move funds to safety.
         </p>
       </button>
     </div>
@@ -335,6 +445,191 @@
           <path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
         </svg>
         Retry Update
+      </Button>
+    </div>
+
+  {:else if mode === 'export' || mode === 'exporting'}
+    <!-- Export: enter mnemonic -->
+    <div class="text-center mb-8">
+      <h2 class="text-3xl font-bold text-gray-900 dark:text-white mb-2">
+        Disaster Recovery
+      </h2>
+      <p class="text-gray-600 dark:text-gray-400">
+        Enter your recovery phrase to derive private keys for any path the bot used.
+        Import the keys into MetaMask to transfer funds to safety.
+      </p>
+    </div>
+
+    <Card>
+      <div class="space-y-4">
+        <textarea
+          bind:value={exportMnemonic}
+          placeholder="Enter your 24-word recovery phrase, separated by spaces..."
+          rows="4"
+          disabled={mode === 'exporting'}
+          class="w-full px-4 py-3 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 text-gray-900 dark:text-white font-mono text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none resize-none disabled:opacity-50"
+        ></textarea>
+
+        {#if errorMsg}
+          <Alert variant="error" title="Error">
+            <p>{errorMsg}</p>
+          </Alert>
+        {/if}
+      </div>
+    </Card>
+
+    <div class="flex justify-between mt-8">
+      <Button variant="ghost" onclick={() => { mode = 'choose'; errorMsg = ''; }} disabled={mode === 'exporting'}>
+        <svg class="w-4 h-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M11 17l-5-5m0 0l5-5m-5 5h12" />
+        </svg>
+        Back
+      </Button>
+      <Button variant="success" size="lg" onclick={submitExportMnemonic} disabled={mode === 'exporting'}>
+        {mode === 'exporting' ? 'Validating...' : 'Continue'}
+        <svg class="w-4 h-4 ml-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M13 7l5 5m0 0l-5 5m5-5H6" />
+        </svg>
+      </Button>
+    </div>
+
+  {:else if mode === 'exported'}
+    <!-- Export results + derive by path -->
+    <div class="text-center mb-8">
+      <h2 class="text-3xl font-bold text-gray-900 dark:text-white mb-2">
+        Disaster Recovery
+      </h2>
+      <p class="text-gray-600 dark:text-gray-400">
+        Derive private keys for each path the bot used. Import into MetaMask to move funds.
+      </p>
+    </div>
+
+    <Alert variant="warning" title="Security Warning">
+      <p>These private keys give full control over the associated addresses. Never share them.</p>
+    </Alert>
+
+    <div class="mt-6 space-y-6">
+      <!-- Solana Key (always one address since TSS doesn't derive EdDSA) -->
+      {#if exportResult?.solAddress}
+        <Card>
+          <h3 class="text-lg font-semibold text-gray-900 dark:text-white mb-4 flex items-center gap-2">
+            <span class="inline-flex items-center justify-center w-8 h-8 rounded-full bg-purple-100 dark:bg-purple-900/50">
+              <span class="text-purple-600 dark:text-purple-400 text-sm font-bold">S</span>
+            </span>
+            Solana (m/44'/501'/0'/0')
+          </h3>
+          <div class="space-y-3">
+            <div>
+              <label class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Address</label>
+              <div class="flex items-center gap-2">
+                <code class="flex-1 px-3 py-2 rounded-lg bg-gray-100 dark:bg-gray-900 text-sm text-gray-900 dark:text-gray-100 font-mono break-all">{exportResult.solAddress}</code>
+                <button onclick={() => copyToClipboard(exportResult.solAddress)} class="shrink-0 px-3 py-2 text-xs rounded-lg bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 transition-colors cursor-pointer">Copy</button>
+              </div>
+            </div>
+            <div>
+              <label class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Private Key (for Phantom)</label>
+              <div class="flex items-center gap-2">
+                <code class="flex-1 px-3 py-2 rounded-lg bg-red-50 dark:bg-red-900/20 text-sm text-red-800 dark:text-red-300 font-mono break-all">{exportResult.solPrivKey}</code>
+                <button onclick={() => copyToClipboard(exportResult.solPrivKey)} class="shrink-0 px-3 py-2 text-xs rounded-lg bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 transition-colors cursor-pointer">Copy</button>
+              </div>
+            </div>
+          </div>
+        </Card>
+      {/if}
+
+      <!-- Derive EVM keys by path -->
+      <Card>
+        <h3 class="text-lg font-semibold text-gray-900 dark:text-white mb-4 flex items-center gap-2">
+          <span class="inline-flex items-center justify-center w-8 h-8 rounded-full bg-blue-100 dark:bg-blue-900/50">
+            <span class="text-blue-600 dark:text-blue-400 text-sm font-bold">E</span>
+          </span>
+          EVM / secp256k1 Keys
+        </h3>
+
+        <p class="text-sm text-gray-600 dark:text-gray-400 mb-4">
+          Enter a derivation path to get the private key for that address. Use the same paths the bot derived (e.g. <code class="text-xs bg-gray-100 dark:bg-gray-800 px-1 rounded">m/44'/60'/0'/0/0</code>).
+        </p>
+
+        <!-- Derive input -->
+        <div class="flex gap-2 mb-4">
+          <input
+            bind:value={derivingPath}
+            placeholder="m/44'/60'/0'/0/0"
+            class="flex-1 px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 text-gray-900 dark:text-white font-mono text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none"
+            onkeydown={(e) => { if (e.key === 'Enter') derivePath(); }}
+          />
+          <Button onclick={derivePath}>Derive</Button>
+        </div>
+
+        {#if errorMsg}
+          <div class="mb-4">
+            <Alert variant="error" title="Error">
+              <p>{errorMsg}</p>
+            </Alert>
+          </div>
+        {/if}
+
+        <!-- DB paths hint -->
+        {#if exportResult?.dbAddresses?.length > 0 && (!exportResult?.derivedKeys || exportResult.derivedKeys.length === 0)}
+          <div class="mb-4 p-3 rounded-lg bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800">
+            <p class="text-sm text-blue-800 dark:text-blue-300 mb-2">
+              Found {exportResult.dbAddresses.filter(a => a.curve === 'secp256k1').length} EVM path(s) in the local database:
+            </p>
+            <div class="flex flex-wrap gap-1 mb-2">
+              {#each exportResult.dbAddresses.filter(a => a.curve === 'secp256k1') as addr}
+                <code class="text-xs bg-blue-100 dark:bg-blue-900/40 text-blue-800 dark:text-blue-200 px-2 py-0.5 rounded">{addr.path}</code>
+              {/each}
+            </div>
+            <Button size="sm" onclick={deriveAllDBPaths}>Derive All DB Paths</Button>
+          </div>
+        {/if}
+
+        <!-- Derived keys table -->
+        {#if exportResult?.derivedKeys?.length > 0}
+          <div class="space-y-3">
+            {#each exportResult.derivedKeys as key}
+              <div class="p-3 rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900/50">
+                <div class="flex items-center justify-between mb-2">
+                  <code class="text-xs font-semibold text-gray-700 dark:text-gray-300">{key.path}</code>
+                  {#if key.error}
+                    <span class="text-xs text-red-500">{key.error}</span>
+                  {/if}
+                </div>
+                {#if !key.error}
+                  <div class="space-y-2">
+                    <div>
+                      <label class="block text-xs text-gray-500 dark:text-gray-400 mb-0.5">Address</label>
+                      <div class="flex items-center gap-2">
+                        <code class="flex-1 text-xs bg-gray-100 dark:bg-gray-800 px-2 py-1 rounded font-mono break-all">{key.address}</code>
+                        <button onclick={() => copyToClipboard(key.address)} class="shrink-0 px-2 py-1 text-xs rounded bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 transition-colors cursor-pointer">Copy</button>
+                      </div>
+                    </div>
+                    <div>
+                      <label class="block text-xs text-gray-500 dark:text-gray-400 mb-0.5">Private Key (import into MetaMask)</label>
+                      <div class="flex items-center gap-2">
+                        <code class="flex-1 text-xs bg-red-50 dark:bg-red-900/20 text-red-800 dark:text-red-300 px-2 py-1 rounded font-mono break-all">{key.privKeyHex}</code>
+                        <button onclick={() => copyToClipboard(key.privKeyHex)} class="shrink-0 px-2 py-1 text-xs rounded bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 transition-colors cursor-pointer">Copy</button>
+                      </div>
+                    </div>
+                  </div>
+                {/if}
+              </div>
+            {/each}
+          </div>
+        {:else}
+          <p class="text-sm text-gray-500 dark:text-gray-400 italic">
+            No keys derived yet. Enter a path above and click Derive.
+          </p>
+        {/if}
+      </Card>
+    </div>
+
+    <div class="flex justify-center mt-8">
+      <Button variant="ghost" onclick={() => { mode = 'choose'; errorMsg = ''; exportResult = null; mnemonicValidated = false; }}>
+        <svg class="w-4 h-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M11 17l-5-5m0 0l5-5m-5 5h12" />
+        </svg>
+        Back to Menu
       </Button>
     </div>
   {/if}

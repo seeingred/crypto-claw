@@ -64,6 +64,13 @@ export async function installRestore(mnemonic) {
   });
 }
 
+export async function installExport(mnemonic, paths = []) {
+  return request('/install/export', {
+    method: 'POST',
+    body: JSON.stringify({ mnemonic, paths }),
+  });
+}
+
 export async function startUpdate() {
   return request('/update', {
     method: 'POST',
