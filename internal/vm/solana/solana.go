@@ -36,7 +36,7 @@ func (a *Adapter) Name() string     { return "solana" }
 func (a *Adapter) Curve() tss.Curve { return tss.CurveEd25519 }
 
 // DeriveAddress returns the base58-encoded address from a 32-byte ed25519 public key.
-func (a *Adapter) DeriveAddress(pubKey []byte) (string, error) {
+func (a *Adapter) DeriveAddress(pubKey []byte, _ ...vm.DeriveOption) (string, error) {
 	if len(pubKey) != 32 {
 		return "", fmt.Errorf("solana: expected 32-byte ed25519 public key, got %d bytes", len(pubKey))
 	}

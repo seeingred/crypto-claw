@@ -28,7 +28,7 @@ func (a *Adapter) Curve() tss.Curve   { return tss.CurveSecp256k1 }
 
 // DeriveAddress computes an Ethereum address from an uncompressed secp256k1 public key.
 // Address = last 20 bytes of keccak256(pubkey[1:]).
-func (a *Adapter) DeriveAddress(pubKey []byte) (string, error) {
+func (a *Adapter) DeriveAddress(pubKey []byte, _ ...vm.DeriveOption) (string, error) {
 	if len(pubKey) != 65 || pubKey[0] != 0x04 {
 		return "", fmt.Errorf("evm: expected 65-byte uncompressed public key, got %d bytes", len(pubKey))
 	}

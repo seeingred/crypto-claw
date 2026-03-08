@@ -37,6 +37,7 @@ type apiHandler struct {
 type deriveRequest struct {
 	DerivationPath string `json:"derivationPath"`
 	Label          string `json:"label"`
+	Prefix         string `json:"prefix,omitempty"` // optional bech32 prefix for Cosmos app chains
 }
 
 func (h *apiHandler) handleDerive(w http.ResponseWriter, r *http.Request) {
@@ -50,7 +51,7 @@ func (h *apiHandler) handleDerive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := h.svc.Derive(r.Context(), req.DerivationPath, req.Label)
+	result, err := h.svc.Derive(r.Context(), req.DerivationPath, req.Label, req.Prefix)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -74,6 +75,13 @@ type signAPIRequest struct {
 	Program         string                  `json:"program,omitempty"`      // Solana: Anchor program ID
 	Method          string                  `json:"method,omitempty"`       // Solana: Anchor instruction name
 	Args            map[string]string       `json:"args,omitempty"`         // Solana: Anchor instruction args
+	Prefix          string                  `json:"prefix,omitempty"`       // Cosmos: bech32 prefix for app chains
+	Denom           string                  `json:"denom,omitempty"`        // Cosmos: token denomination
+	AccountNumber   uint64                  `json:"accountNumber,omitempty"` // Cosmos: account number
+	Sequence        uint64                  `json:"sequence,omitempty"`     // Cosmos: account sequence
+	Fee             string                  `json:"fee,omitempty"`          // Cosmos: fee amount
+	Gas             uint64                  `json:"gas,omitempty"`          // Cosmos: gas limit
+	Memo            string                  `json:"memo,omitempty"`         // Cosmos: memo
 }
 
 func (h *apiHandler) handleSign(w http.ResponseWriter, r *http.Request) {
@@ -121,6 +129,13 @@ func (h *apiHandler) handleSign(w http.ResponseWriter, r *http.Request) {
 		Program:         req.Program,
 		Method:          req.Method,
 		Args:            req.Args,
+		Prefix:          req.Prefix,
+		Denom:           req.Denom,
+		AccountNumber:   req.AccountNumber,
+		Sequence:        req.Sequence,
+		Fee:             req.Fee,
+		Gas:             req.Gas,
+		Memo:            req.Memo,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -266,6 +281,7 @@ path always produces the same address.
 |-------|------|----------|-------------|
 | derivationPath | string | yes | BIP-44 path (see derivation paths below) |
 | label | string | no | Human-readable name for this wallet |
+| prefix | string | no | Bech32 prefix for Cosmos app chains (e.g. "osmo", "juno", "inj"). Defaults to "cosmos" |
 
 **Response:**
 ` + "```json" + `
@@ -282,7 +298,7 @@ path always produces the same address.
 |-------|-----------|-------------|----------------|
 | Ethereum / EVM | 60 | m/44'/60'/0'/0/0 | 0x... (20 bytes) |
 | Solana | 501 | m/44'/501'/0'/0' | Base58 (32 bytes) |
-| Cosmos | 118 | m/44'/118'/0'/0/0 | cosmos1... (bech32) |
+| Cosmos | 118 | m/44'/118'/0'/0/0 | cosmos1... (bech32). Pass prefix for app chains (osmo1..., juno1...) |
 
 To derive multiple wallets for the same chain, increment the last index:
 - m/44'/60'/0'/0/0 → first ETH wallet
@@ -321,6 +337,13 @@ are chain-specific and ignored by adapters that don't use them.
 | gasPrice | string | no | EVM gas price in wei |
 | nonce | number | no | EVM transaction nonce |
 | rpcUrl | string | no | Solana RPC endpoint URL. The service fetches a fresh blockhash right before signing. **Required for Solana** |
+| prefix | string | no | Cosmos: bech32 prefix for app chains (e.g. "osmo"). Defaults to config value |
+| denom | string | no | Cosmos: token denomination (e.g. "uosmo"). Defaults to config value |
+| accountNumber | number | no | Cosmos: account number (query from chain) |
+| sequence | number | no | Cosmos: account sequence / nonce (query from chain) |
+| fee | string | no | Cosmos: fee amount in denom units (default: "5000") |
+| gas | number | no | Cosmos: gas limit (default: 200000) |
+| memo | string | no | Cosmos: transaction memo |
 
 **EVM example** (ETH transfer):
 ` + "```json" + `
@@ -404,9 +427,33 @@ transaction.
   "derivationPath": "m/44'/118'/0'/0/0",
   "to": ["cosmos1recipient..."],
   "value": "1000000",
-  "chainId": "cosmoshub-4"
+  "chainId": "cosmoshub-4",
+  "accountNumber": 12345,
+  "sequence": 0,
+  "fee": "5000",
+  "gas": 200000
 }
 ` + "```" + `
+
+**Cosmos app chain example** (OSMO transfer on Osmosis):
+` + "```json" + `
+{
+  "derivationPath": "m/44'/118'/0'/0/0",
+  "to": ["osmo1recipient..."],
+  "value": "1000000",
+  "chainId": "osmosis-1",
+  "prefix": "osmo",
+  "denom": "uosmo",
+  "accountNumber": 67890,
+  "sequence": 3,
+  "fee": "2500",
+  "gas": 100000
+}
+` + "```" + `
+
+The signed transaction is returned as protobuf-encoded TxRaw (hex). Broadcast it via
+the chain's REST endpoint: POST /cosmos/tx/v1beta1/txs with mode BROADCAST_MODE_SYNC.
+Query accountNumber and sequence from /cosmos/auth/v1beta1/accounts/{address} before signing.
 
 **Notes:**
 - Solana: pass rpcUrl so the service fetches a fresh blockhash right before signing.

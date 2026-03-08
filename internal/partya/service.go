@@ -64,7 +64,7 @@ type DeriveResult struct {
 }
 
 // Derive derives a new child key for the given derivation path and label.
-func (s *Service) Derive(ctx context.Context, derivationPath, label string) (*DeriveResult, error) {
+func (s *Service) Derive(ctx context.Context, derivationPath, label, prefix string) (*DeriveResult, error) {
 	// Look up the adapter for this derivation path
 	adapter, ok := s.vmRegistry.ForPath(derivationPath)
 	if !ok {
@@ -84,7 +84,11 @@ func (s *Service) Derive(ctx context.Context, derivationPath, label string) (*De
 	}
 
 	// Derive chain-specific address
-	address, err := adapter.DeriveAddress(derived.PublicKey)
+	var deriveOpts []vm.DeriveOption
+	if prefix != "" {
+		deriveOpts = append(deriveOpts, vm.WithPrefix(prefix))
+	}
+	address, err := adapter.DeriveAddress(derived.PublicKey, deriveOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("derive address: %w", err)
 	}
@@ -135,6 +139,13 @@ type SignRequest struct {
 	Program         string                 `json:"program,omitempty"`
 	Method          string                 `json:"method,omitempty"`
 	Args            map[string]string      `json:"args,omitempty"`
+	Prefix          string                 `json:"prefix,omitempty"`
+	Denom           string                 `json:"denom,omitempty"`
+	AccountNumber   uint64                 `json:"accountNumber,omitempty"`
+	Sequence        uint64                 `json:"sequence,omitempty"`
+	Fee             string                 `json:"fee,omitempty"`
+	Gas             uint64                 `json:"gas,omitempty"`
+	Memo            string                 `json:"memo,omitempty"`
 }
 
 // SignResult holds the result of a sign request.
@@ -161,10 +172,18 @@ func (s *Service) Sign(ctx context.Context, req *SignRequest) (*SignResult, erro
 	// Build the unsigned transaction
 	txReq := &vm.TxRequest{
 		From:            derivedKey.Address,
+		PubKey:          derivedKey.PublicKey,
 		To:              req.To,
 		Value:           req.Value,
 		Data:            req.Data,
 		DerivationPath:  req.DerivationPath,
+		Prefix:          req.Prefix,
+		Denom:           req.Denom,
+		AccountNumber:   req.AccountNumber,
+		Sequence:        req.Sequence,
+		Fee:             req.Fee,
+		Gas:             req.Gas,
+		Memo:            req.Memo,
 		ChainID:         req.ChainID,
 		GasLimit:        req.GasLimit,
 		GasPrice:        req.GasPrice,

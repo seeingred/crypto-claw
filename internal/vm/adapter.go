@@ -15,7 +15,8 @@ type Adapter interface {
 	Curve() tss.Curve
 
 	// DeriveAddress computes the chain-specific address from a public key.
-	DeriveAddress(pubKey []byte) (string, error)
+	// Options (e.g. bech32 prefix for Cosmos) can be passed via opts.
+	DeriveAddress(pubKey []byte, opts ...DeriveOption) (string, error)
 
 	// BuildUnsignedTx constructs an unsigned transaction from the request parameters.
 	BuildUnsignedTx(ctx context.Context, req *TxRequest) (*UnsignedTx, error)
@@ -53,7 +54,15 @@ type TxRequest struct {
 	DerivationPath string   `json:"derivationPath"`
 
 	// Chain-specific fields
+	Prefix          string `json:"prefix,omitempty"`         // bech32 prefix for Cosmos app chains (e.g. "osmo")
+	Denom           string `json:"denom,omitempty"`          // token denomination for Cosmos (e.g. "uosmo")
 	ChainID         string `json:"chainId,omitempty"`
+	AccountNumber   uint64 `json:"accountNumber,omitempty"`  // Cosmos account number
+	Sequence        uint64 `json:"sequence,omitempty"`       // Cosmos account sequence (like EVM nonce)
+	Fee             string `json:"fee,omitempty"`            // Cosmos fee amount in denom units
+	Gas             uint64 `json:"gas,omitempty"`            // Cosmos gas limit
+	Memo            string `json:"memo,omitempty"`           // Cosmos memo field
+	PubKey          []byte `json:"-"`                        // signer public key (set internally)
 	GasLimit        uint64 `json:"gasLimit,omitempty"`
 	GasPrice        string `json:"gasPrice,omitempty"`
 	Nonce           uint64 `json:"nonce,omitempty"`
@@ -92,6 +101,27 @@ type DecodedTx struct {
 	Args     map[string]string `json:"args,omitempty"`   // decoded function args
 	ChainID  string            `json:"chainId,omitempty"`
 	GasLimit uint64            `json:"gasLimit,omitempty"`
+}
+
+// DeriveOption configures address derivation.
+type DeriveOption func(*deriveOpts)
+
+type deriveOpts struct {
+	Prefix string
+}
+
+// WithPrefix sets the bech32 prefix for Cosmos address derivation.
+func WithPrefix(prefix string) DeriveOption {
+	return func(o *deriveOpts) { o.Prefix = prefix }
+}
+
+// ApplyDeriveOpts applies options and returns the resolved config.
+func ApplyDeriveOpts(opts []DeriveOption) deriveOpts {
+	var o deriveOpts
+	for _, fn := range opts {
+		fn(&o)
+	}
+	return o
 }
 
 // Registry holds available VM adapters keyed by derivation path prefix.
