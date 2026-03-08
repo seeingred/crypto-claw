@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sync/atomic"
 	"time"
 
@@ -120,16 +121,20 @@ func (s *Service) Derive(ctx context.Context, derivationPath, label string) (*De
 
 // SignRequest holds the parameters for a sign request.
 type SignRequest struct {
-	DerivationPath  string   `json:"derivationPath"`
-	To              []string `json:"to"`
-	Value           string   `json:"value,omitempty"`
-	Data            []byte   `json:"data,omitempty"`
-	ChainID         string   `json:"chainId,omitempty"`
-	GasLimit        uint64   `json:"gasLimit,omitempty"`
-	GasPrice        string   `json:"gasPrice,omitempty"`
-	Nonce           uint64   `json:"nonce,omitempty"`
-	RpcURL          string   `json:"rpcUrl,omitempty"`
-	Mint            string   `json:"mint,omitempty"`
+	DerivationPath  string                `json:"derivationPath"`
+	To              []string              `json:"to"`
+	Value           string                `json:"value,omitempty"`
+	Data            []byte                `json:"data,omitempty"`
+	ChainID         string                `json:"chainId,omitempty"`
+	GasLimit        uint64                `json:"gasLimit,omitempty"`
+	GasPrice        string                `json:"gasPrice,omitempty"`
+	Nonce           uint64                `json:"nonce,omitempty"`
+	RpcURL          string                `json:"rpcUrl,omitempty"`
+	Mint            string                `json:"mint,omitempty"`
+	Instructions    []vm.SolanaInstruction `json:"instructions,omitempty"`
+	Program         string                 `json:"program,omitempty"`
+	Method          string                 `json:"method,omitempty"`
+	Args            map[string]string      `json:"args,omitempty"`
 }
 
 // SignResult holds the result of a sign request.
@@ -166,6 +171,10 @@ func (s *Service) Sign(ctx context.Context, req *SignRequest) (*SignResult, erro
 		Nonce:           req.Nonce,
 		RpcURL:          req.RpcURL,
 		Mint:            req.Mint,
+		Instructions:    req.Instructions,
+		Program:         req.Program,
+		Method:          req.Method,
+		Args:            req.Args,
 	}
 	unsignedTx, err := adapter.BuildUnsignedTx(ctx, txReq)
 	if err != nil {
@@ -229,13 +238,17 @@ func (s *Service) Sign(ctx context.Context, req *SignRequest) (*SignResult, erro
 	case "escalate":
 		// Store as pending for human review
 		txID := signResp.TxID
-		s.escalation.Add(txID, signResp.Reason, unsignedTx.RawBytes, req.RpcURL)
+		s.escalation.Add(txID, signResp.Reason, unsignedTx.RawBytes, req.RpcURL, unsignedTx.ExtraSignerKeys)
 
 		// Persist to store
+		to := req.To
+		if to == nil {
+			to = []string{}
+		}
 		txRecord := &store.TxRecord{
 			ID:             txID,
 			DerivationPath: req.DerivationPath,
-			To:             req.To,
+			To:             to,
 			Value:          req.Value,
 			UnsignedTx:     unsignedTx.RawBytes,
 			Status:         store.TxStatusPending,
@@ -310,7 +323,14 @@ func (s *Service) runTSSSigning(ctx context.Context, adapter vm.Adapter, derived
 		return nil, fmt.Errorf("TSS sign: %w", err)
 	}
 
-	signedTx, err := adapter.AssembleSignedTx(unsignedTx.RawBytes, sig)
+	// If there are extra signer keys (Solana ephemeral keypairs), use the
+	// extended assembly that signs with them too.
+	var signedTx []byte
+	if len(unsignedTx.ExtraSignerKeys) > 0 && adapter.Name() == "solana" {
+		signedTx, err = solanarpc.AssembleSignedTxWithExtra(unsignedTx.RawBytes, sig, unsignedTx.ExtraSignerKeys)
+	} else {
+		signedTx, err = adapter.AssembleSignedTx(unsignedTx.RawBytes, sig)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("assemble signed tx: %w", err)
 	}
@@ -324,28 +344,35 @@ func (s *Service) HandleSignApproved(ctx context.Context, txID, derivationPath s
 	// Look up the pending tx.
 	pending, ok := s.escalation.Get(txID)
 	if !ok {
+		slog.Error("sign-approved: pending tx not found in escalation queue", "txID", txID)
 		return
 	}
 
 	// Look up adapter and key.
 	adapter, ok := s.vmRegistry.ForPath(derivationPath)
 	if !ok {
+		slog.Error("sign-approved: no adapter for path", "txID", txID, "path", derivationPath)
 		s.escalation.Update(txID, store.TxStatusRejected, nil)
 		return
 	}
 
 	derivedKey, err := s.store.GetDerivedKey(ctx, derivationPath)
 	if err != nil {
+		slog.Error("sign-approved: get derived key failed", "txID", txID, "path", derivationPath, "err", err)
 		s.escalation.Update(txID, store.TxStatusRejected, nil)
 		return
 	}
 
-	unsignedTx := &vm.UnsignedTx{RawBytes: pending.UnsignedTx}
+	unsignedTx := &vm.UnsignedTx{
+		RawBytes:        pending.UnsignedTx,
+		ExtraSignerKeys: pending.ExtraSignerKeys,
+	}
 
 	// Run TSS signing (Party B is also running its side).
 	// For Solana, pending.RpcURL is used to fetch a fresh blockhash.
 	signedTx, err := s.runTSSSigning(ctx, adapter, derivedKey, unsignedTx, pending.RpcURL, txID)
 	if err != nil {
+		slog.Error("sign-approved: TSS signing failed", "txID", txID, "err", err)
 		s.escalation.Update(txID, store.TxStatusRejected, nil)
 		return
 	}

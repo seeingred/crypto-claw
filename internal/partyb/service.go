@@ -152,10 +152,14 @@ func (s *Service) HandleSignRequest(ctx context.Context, msgID uint64, req trans
 	s.logger.Info("received sign request", "txID", txID, "to", req.To, "path", req.DerivationPath)
 
 	// Store the transaction.
+	to := req.To
+	if to == nil {
+		to = []string{}
+	}
 	txRecord := &store.TxRecord{
 		ID:             txID,
 		DerivationPath: req.DerivationPath,
-		To:             req.To,
+		To:             to,
 		Value:          req.Value,
 		Data:           req.Data,
 		Status:         store.TxStatusPending,

@@ -3,6 +3,8 @@ package solana
 import (
 	"bytes"
 	"context"
+	crypto_ed25519 "crypto/ed25519"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -19,6 +21,9 @@ import (
 	"github.com/seeingred/crypto-claw/internal/tss"
 	"github.com/seeingred/crypto-claw/internal/vm"
 )
+
+// ed25519PrivKey is an alias for crypto/ed25519.PrivateKey.
+type ed25519PrivKey = crypto_ed25519.PrivateKey
 
 // Adapter implements the vm.Adapter interface for Solana.
 type Adapter struct{}
@@ -49,79 +54,113 @@ type txEnvelope struct {
 	RecentHash string `json:"recentHash,omitempty"` // recent blockhash
 }
 
-// BuildUnsignedTx constructs a Solana transaction for SOL or SPL token transfers.
+// BuildUnsignedTx constructs a Solana transaction for SOL transfers, SPL token
+// transfers, or arbitrary program instructions.
 func (a *Adapter) BuildUnsignedTx(ctx context.Context, req *vm.TxRequest) (*vm.UnsignedTx, error) {
-	if len(req.To) == 0 {
-		return nil, fmt.Errorf("solana: at least one recipient required")
-	}
-
 	from := solana.MustPublicKeyFromBase58(req.From)
-	to := solana.MustPublicKeyFromBase58(req.To[0])
-
-	var amount uint64
-	if req.Value != "" {
-		if _, err := fmt.Sscanf(req.Value, "%d", &amount); err != nil {
-			return nil, fmt.Errorf("solana: invalid value %q: %w", req.Value, err)
-		}
-	}
 
 	var instructions []solana.Instruction
 
-	if req.Mint != "" {
-		// SPL token transfer: detect token program (legacy vs Token-2022) via RPC.
-		mint := solana.MustPublicKeyFromBase58(req.Mint)
+	var extraSigners []ed25519PrivKey
 
-		tokenProgramID := solana.TokenProgramID // default to legacy
-		if req.RpcURL != "" {
-			detected, err := detectTokenProgram(ctx, req.RpcURL, mint)
-			if err != nil {
-				return nil, fmt.Errorf("solana: detect token program: %w", err)
+	if req.Program != "" && req.Method != "" {
+		// Anchor program call: fetch IDL, resolve accounts, build instruction.
+		result, err := BuildAnchorTx(ctx, req, from)
+		if err != nil {
+			return nil, fmt.Errorf("solana: anchor: %w", err)
+		}
+		instructions = result.Instructions
+		for _, priv := range result.ExtraSigners {
+			extraSigners = append(extraSigners, ed25519PrivKey(priv))
+		}
+	} else if len(req.Instructions) > 0 {
+		// Raw instructions mode: build from caller-provided instructions.
+		for i, ix := range req.Instructions {
+			programID := solana.MustPublicKeyFromBase58(ix.ProgramID)
+			accounts := make([]*solana.AccountMeta, len(ix.Accounts))
+			for j, acc := range ix.Accounts {
+				accounts[j] = &solana.AccountMeta{
+					PublicKey:  solana.MustPublicKeyFromBase58(acc.Pubkey),
+					IsSigner:   acc.IsSigner,
+					IsWritable: acc.IsWritable,
+				}
 			}
-			tokenProgramID = detected
+			data, err := base64.StdEncoding.DecodeString(ix.Data)
+			if err != nil {
+				return nil, fmt.Errorf("solana: instruction[%d] invalid base64 data: %w", i, err)
+			}
+			instructions = append(instructions, solana.NewInstruction(programID, accounts, data))
 		}
-
-		fromATA, _, err := findATA(from, mint, tokenProgramID)
-		if err != nil {
-			return nil, fmt.Errorf("solana: find from ATA: %w", err)
-		}
-		toATA, _, err := findATA(to, mint, tokenProgramID)
-		if err != nil {
-			return nil, fmt.Errorf("solana: find to ATA: %w", err)
-		}
-
-		// Create recipient ATA if it doesn't exist (idempotent).
-		// Instruction discriminator 1 = CreateIdempotent.
-		instructions = append(instructions, solana.NewInstruction(
-			solana.SPLAssociatedTokenAccountProgramID,
-			[]*solana.AccountMeta{
-				{PublicKey: from, IsSigner: true, IsWritable: true},
-				{PublicKey: toATA, IsSigner: false, IsWritable: true},
-				{PublicKey: to, IsSigner: false, IsWritable: false},
-				{PublicKey: mint, IsSigner: false, IsWritable: false},
-				{PublicKey: solana.SystemProgramID, IsSigner: false, IsWritable: false},
-				{PublicKey: tokenProgramID, IsSigner: false, IsWritable: false},
-			},
-			[]byte{1}, // CreateIdempotent
-		))
-
-		// SPL Transfer: discriminator 3 + uint64 amount (little-endian).
-		transferData := make([]byte, 9)
-		transferData[0] = 3
-		binary.LittleEndian.PutUint64(transferData[1:], amount)
-		instructions = append(instructions, solana.NewInstruction(
-			tokenProgramID,
-			[]*solana.AccountMeta{
-				{PublicKey: fromATA, IsSigner: false, IsWritable: true},
-				{PublicKey: toATA, IsSigner: false, IsWritable: true},
-				{PublicKey: from, IsSigner: true, IsWritable: false},
-			},
-			transferData,
-		))
 	} else {
-		// Simple SOL transfer
-		instructions = append(instructions,
-			system.NewTransferInstruction(amount, from, to).Build(),
-		)
+		// Legacy transfer mode
+		if len(req.To) == 0 {
+			return nil, fmt.Errorf("solana: at least one recipient required")
+		}
+		to := solana.MustPublicKeyFromBase58(req.To[0])
+
+		var amount uint64
+		if req.Value != "" {
+			if _, err := fmt.Sscanf(req.Value, "%d", &amount); err != nil {
+				return nil, fmt.Errorf("solana: invalid value %q: %w", req.Value, err)
+			}
+		}
+
+		if req.Mint != "" {
+			// SPL token transfer: detect token program (legacy vs Token-2022) via RPC.
+			mint := solana.MustPublicKeyFromBase58(req.Mint)
+
+			tokenProgramID := solana.TokenProgramID // default to legacy
+			if req.RpcURL != "" {
+				detected, err := detectTokenProgram(ctx, req.RpcURL, mint)
+				if err != nil {
+					return nil, fmt.Errorf("solana: detect token program: %w", err)
+				}
+				tokenProgramID = detected
+			}
+
+			fromATA, _, err := findATA(from, mint, tokenProgramID)
+			if err != nil {
+				return nil, fmt.Errorf("solana: find from ATA: %w", err)
+			}
+			toATA, _, err := findATA(to, mint, tokenProgramID)
+			if err != nil {
+				return nil, fmt.Errorf("solana: find to ATA: %w", err)
+			}
+
+			// Create recipient ATA if it doesn't exist (idempotent).
+			// Instruction discriminator 1 = CreateIdempotent.
+			instructions = append(instructions, solana.NewInstruction(
+				solana.SPLAssociatedTokenAccountProgramID,
+				[]*solana.AccountMeta{
+					{PublicKey: from, IsSigner: true, IsWritable: true},
+					{PublicKey: toATA, IsSigner: false, IsWritable: true},
+					{PublicKey: to, IsSigner: false, IsWritable: false},
+					{PublicKey: mint, IsSigner: false, IsWritable: false},
+					{PublicKey: solana.SystemProgramID, IsSigner: false, IsWritable: false},
+					{PublicKey: tokenProgramID, IsSigner: false, IsWritable: false},
+				},
+				[]byte{1}, // CreateIdempotent
+			))
+
+			// SPL Transfer: discriminator 3 + uint64 amount (little-endian).
+			transferData := make([]byte, 9)
+			transferData[0] = 3
+			binary.LittleEndian.PutUint64(transferData[1:], amount)
+			instructions = append(instructions, solana.NewInstruction(
+				tokenProgramID,
+				[]*solana.AccountMeta{
+					{PublicKey: fromATA, IsSigner: false, IsWritable: true},
+					{PublicKey: toATA, IsSigner: false, IsWritable: true},
+					{PublicKey: from, IsSigner: true, IsWritable: false},
+				},
+				transferData,
+			))
+		} else {
+			// Simple SOL transfer
+			instructions = append(instructions,
+				system.NewTransferInstruction(amount, from, to).Build(),
+			)
+		}
 	}
 
 	tx, err := solana.NewTransaction(
@@ -131,6 +170,12 @@ func (a *Adapter) BuildUnsignedTx(ctx context.Context, req *vm.TxRequest) (*vm.U
 	)
 	if err != nil {
 		return nil, fmt.Errorf("solana: build tx: %w", err)
+	}
+
+	// Collect ephemeral private keys for later signing (after blockhash injection).
+	var extraSignerKeys [][]byte
+	for _, priv := range extraSigners {
+		extraSignerKeys = append(extraSignerKeys, []byte(priv))
 	}
 
 	msgBytes, err := tx.Message.MarshalBinary()
@@ -144,10 +189,11 @@ func (a *Adapter) BuildUnsignedTx(ctx context.Context, req *vm.TxRequest) (*vm.U
 	}
 
 	return &vm.UnsignedTx{
-		RawBytes: rawBytes,
-		Hash:     msgBytes, // Solana signs the message bytes directly
-		To:       req.To,
-		Value:    req.Value,
+		RawBytes:        rawBytes,
+		Hash:            msgBytes,
+		To:              req.To,
+		Value:           req.Value,
+		ExtraSignerKeys: extraSignerKeys,
 	}, nil
 }
 
@@ -166,6 +212,12 @@ func (a *Adapter) ExtractSignableBytes(unsignedTx []byte) ([]byte, error) {
 
 // AssembleSignedTx places the ed25519 signature into the transaction.
 func (a *Adapter) AssembleSignedTx(unsignedTx []byte, sig *tss.Signature) ([]byte, error) {
+	return AssembleSignedTxWithExtra(unsignedTx, sig, nil)
+}
+
+// AssembleSignedTxWithExtra places the TSS signature and signs with any extra
+// ephemeral private keys, placing all signatures at their correct indices.
+func AssembleSignedTxWithExtra(unsignedTx []byte, sig *tss.Signature, extraKeys [][]byte) ([]byte, error) {
 	tx, err := solana.TransactionFromBytes(unsignedTx)
 	if err != nil {
 		return nil, fmt.Errorf("solana: decode tx: %w", err)
@@ -175,9 +227,35 @@ func (a *Adapter) AssembleSignedTx(unsignedTx []byte, sig *tss.Signature) ([]byt
 		return nil, fmt.Errorf("solana: expected 64-byte ed25519 signature, got %d", len(sig.Bytes))
 	}
 
-	var solSig solana.Signature
-	copy(solSig[:], sig.Bytes)
-	tx.Signatures = []solana.Signature{solSig}
+	numSigs := int(tx.Message.Header.NumRequiredSignatures)
+	if numSigs < 1 {
+		numSigs = 1
+	}
+	tx.Signatures = make([]solana.Signature, numSigs)
+
+	// Slot 0 = payer (TSS signature).
+	copy(tx.Signatures[0][:], sig.Bytes)
+
+	// Sign with ephemeral private keys and place at correct indices.
+	if len(extraKeys) > 0 {
+		msgBytes, err := tx.Message.MarshalBinary()
+		if err != nil {
+			return nil, fmt.Errorf("solana: serialize message for extra signers: %w", err)
+		}
+		for _, privBytes := range extraKeys {
+			priv := crypto_ed25519.PrivateKey(privBytes)
+			pub := priv.Public().(crypto_ed25519.PublicKey)
+			pk := solana.PublicKeyFromBytes(pub)
+			// Find signature index.
+			for i, key := range tx.Message.AccountKeys {
+				if key == pk && i > 0 && i < numSigs {
+					sigBytes := crypto_ed25519.Sign(priv, msgBytes)
+					copy(tx.Signatures[i][:], sigBytes)
+					break
+				}
+			}
+		}
+	}
 
 	raw, err := tx.MarshalBinary()
 	if err != nil {

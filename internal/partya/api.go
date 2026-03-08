@@ -6,6 +6,8 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+
+	"github.com/seeingred/crypto-claw/internal/vm"
 )
 
 // NewRouter creates the chi router with all Party A REST endpoints.
@@ -58,16 +60,20 @@ func (h *apiHandler) handleDerive(w http.ResponseWriter, r *http.Request) {
 }
 
 type signAPIRequest struct {
-	DerivationPath  string   `json:"derivationPath"`
-	To              []string `json:"to"`
-	Value           string   `json:"value,omitempty"`
-	Data            string   `json:"data,omitempty"` // hex-encoded
-	ChainID         string   `json:"chainId,omitempty"`
-	GasLimit        uint64   `json:"gasLimit,omitempty"`
-	GasPrice        string   `json:"gasPrice,omitempty"`
-	Nonce           uint64   `json:"nonce,omitempty"`
-	RpcURL          string   `json:"rpcUrl,omitempty"` // Solana RPC URL for fetching blockhash at sign time
-	Mint            string   `json:"mint,omitempty"`   // Solana SPL token mint address (base58)
+	DerivationPath  string                  `json:"derivationPath"`
+	To              []string                `json:"to"`
+	Value           string                  `json:"value,omitempty"`
+	Data            string                  `json:"data,omitempty"` // hex-encoded
+	ChainID         string                  `json:"chainId,omitempty"`
+	GasLimit        uint64                  `json:"gasLimit,omitempty"`
+	GasPrice        string                  `json:"gasPrice,omitempty"`
+	Nonce           uint64                  `json:"nonce,omitempty"`
+	RpcURL          string                  `json:"rpcUrl,omitempty"`   // Solana RPC URL for fetching blockhash at sign time
+	Mint            string                  `json:"mint,omitempty"`     // Solana SPL token mint address (base58)
+	Instructions    []vm.SolanaInstruction  `json:"instructions,omitempty"` // Solana: raw program instructions
+	Program         string                  `json:"program,omitempty"`      // Solana: Anchor program ID
+	Method          string                  `json:"method,omitempty"`       // Solana: Anchor instruction name
+	Args            map[string]string       `json:"args,omitempty"`         // Solana: Anchor instruction args
 }
 
 func (h *apiHandler) handleSign(w http.ResponseWriter, r *http.Request) {
@@ -76,8 +82,12 @@ func (h *apiHandler) handleSign(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.DerivationPath == "" || len(req.To) == 0 {
-		writeError(w, http.StatusBadRequest, "derivationPath and to are required")
+	if req.DerivationPath == "" {
+		writeError(w, http.StatusBadRequest, "derivationPath is required")
+		return
+	}
+	if len(req.To) == 0 && len(req.Instructions) == 0 && req.Program == "" {
+		writeError(w, http.StatusBadRequest, "to, instructions, or program required")
 		return
 	}
 
@@ -107,6 +117,10 @@ func (h *apiHandler) handleSign(w http.ResponseWriter, r *http.Request) {
 		Nonce:           req.Nonce,
 		RpcURL:          req.RpcURL,
 		Mint:            req.Mint,
+		Instructions:    req.Instructions,
+		Program:         req.Program,
+		Method:          req.Method,
+		Args:            req.Args,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -298,6 +312,10 @@ are chain-specific and ignored by adapters that don't use them.
 | value | string | no | Value in smallest unit (wei, lamports, uatom) |
 | data | string | no | Hex-encoded calldata (EVM only) |
 | mint | string | no | Solana SPL token mint address (base58) |
+| instructions | array | no | Solana raw program instructions (advanced) |
+| program | string | no | Solana Anchor program ID (base58). Use with method/args |
+| method | string | no | Anchor instruction name (e.g. "stake", "redeem") |
+| args | object | no | Anchor instruction arguments as key-value strings |
 | chainId | string | no | EVM chain ID (1=Ethereum, 56=BSC, 137=Polygon) or Cosmos chain ID |
 | gasLimit | number | no | EVM gas limit |
 | gasPrice | string | no | EVM gas price in wei |
@@ -340,6 +358,45 @@ are chain-specific and ignored by adapters that don't use them.
 
 The mint field is the SPL token mint address in base58.
 The service automatically resolves Associated Token Accounts (ATAs) for sender and recipient.
+
+**Solana example** (Anchor program call):
+` + "```json" + `
+{
+  "derivationPath": "m/44'/501'/0'/0'",
+  "program": "YourProgramId...",
+  "method": "stake",
+  "args": {"amount": "1000000000"},
+  "mint": "TokenMintAddress...",
+  "rpcUrl": "https://api.mainnet-beta.solana.com"
+}
+` + "```" + `
+
+When using program/method/args, the service fetches the Anchor IDL from chain and
+automatically resolves all accounts (PDAs, ATAs, system programs). The bot only needs
+to specify the program, method name, arguments, and optionally the token mint.
+
+**Solana example** (arbitrary program instruction — advanced):
+` + "```json" + `
+{
+  "derivationPath": "m/44'/501'/0'/0'",
+  "instructions": [
+    {
+      "programId": "YourProgramId...",
+      "accounts": [
+        {"pubkey": "Account1...", "isSigner": true, "isWritable": true},
+        {"pubkey": "Account2...", "isSigner": false, "isWritable": true}
+      ],
+      "data": "base64EncodedInstructionData"
+    }
+  ],
+  "rpcUrl": "https://api.mainnet-beta.solana.com"
+}
+` + "```" + `
+
+When using instructions, the to field is optional. Each instruction specifies its own
+programId, accounts, and data (base64-encoded). The payer is always the derived key
+address (from derivationPath). Multiple instructions can be included in a single
+transaction.
 
 **Cosmos example** (ATOM transfer):
 ` + "```json" + `

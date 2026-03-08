@@ -8,12 +8,13 @@ import (
 
 // PendingTx represents an escalated transaction awaiting human review.
 type PendingTx struct {
-	TxID       string         `json:"txId"`
-	Status     store.TxStatus `json:"status"`
-	Reason     string         `json:"reason,omitempty"`
-	UnsignedTx []byte         `json:"-"`              // raw unsigned tx for TSS signing on approval
-	SignedTx   []byte         `json:"signedTx,omitempty"`
-	RpcURL     string         `json:"-"`              // Solana RPC URL for fetching blockhash at sign time
+	TxID            string         `json:"txId"`
+	Status          store.TxStatus `json:"status"`
+	Reason          string         `json:"reason,omitempty"`
+	UnsignedTx      []byte         `json:"-"`              // raw unsigned tx for TSS signing on approval
+	SignedTx        []byte         `json:"signedTx,omitempty"`
+	RpcURL          string         `json:"-"`              // Solana RPC URL for fetching blockhash at sign time
+	ExtraSignerKeys [][]byte       `json:"-"`              // Solana: ephemeral private keys for additional signers
 }
 
 // EscalationQueue manages in-memory pending escalated transactions.
@@ -30,15 +31,16 @@ func NewEscalationQueue() *EscalationQueue {
 }
 
 // Add adds a new pending transaction to the queue.
-func (q *EscalationQueue) Add(txID, reason string, unsignedTx []byte, rpcURL string) {
+func (q *EscalationQueue) Add(txID, reason string, unsignedTx []byte, rpcURL string, extraSignerKeys [][]byte) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.pending[txID] = &PendingTx{
-		TxID:       txID,
-		Status:     store.TxStatusPending,
-		Reason:     reason,
-		UnsignedTx: unsignedTx,
-		RpcURL:     rpcURL,
+		TxID:            txID,
+		Status:          store.TxStatusPending,
+		Reason:          reason,
+		UnsignedTx:      unsignedTx,
+		RpcURL:          rpcURL,
+		ExtraSignerKeys: extraSignerKeys,
 	}
 }
 

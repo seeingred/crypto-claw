@@ -30,6 +30,20 @@ type Adapter interface {
 	DecodeTx(txBytes []byte) (*DecodedTx, error)
 }
 
+// SolanaAccountMeta describes an account input for a Solana instruction.
+type SolanaAccountMeta struct {
+	Pubkey     string `json:"pubkey"`
+	IsSigner   bool   `json:"isSigner"`
+	IsWritable bool   `json:"isWritable"`
+}
+
+// SolanaInstruction describes a single Solana program instruction.
+type SolanaInstruction struct {
+	ProgramID string              `json:"programId"`
+	Accounts  []SolanaAccountMeta `json:"accounts"`
+	Data      string              `json:"data"` // base64-encoded instruction data
+}
+
 // TxRequest represents a transaction construction request.
 type TxRequest struct {
 	From           string   `json:"from"`           // sender address
@@ -46,15 +60,26 @@ type TxRequest struct {
 	AutoNonce       bool   `json:"autoNonce,omitempty"`       // fetch nonce from chain
 	RpcURL          string `json:"rpcUrl,omitempty"` // Solana RPC URL for fetching blockhash at sign time
 	Mint            string `json:"mint,omitempty"`   // Solana SPL token mint (base58)
+
+	// Solana: raw instructions for arbitrary program calls
+	Instructions []SolanaInstruction `json:"instructions,omitempty"`
+
+	// Solana: Anchor program call (IDL-based, auto-resolves accounts/PDAs)
+	Program string            `json:"program,omitempty"` // program ID (base58)
+	Method  string            `json:"method,omitempty"`  // instruction name
+	Args    map[string]string `json:"args,omitempty"`    // instruction arguments
 }
 
 // UnsignedTx wraps a constructed unsigned transaction.
 type UnsignedTx struct {
-	RawBytes []byte   `json:"rawBytes"` // serialized unsigned tx
-	Hash     []byte   `json:"hash"`     // signable hash
-	To       []string `json:"to"`
-	Value    string   `json:"value,omitempty"`
-	Data     string   `json:"data,omitempty"` // hex calldata
+	RawBytes    []byte   `json:"rawBytes"` // serialized unsigned tx
+	Hash        []byte   `json:"hash"`     // signable hash
+	To          []string `json:"to"`
+	Value       string   `json:"value,omitempty"`
+	Data        string   `json:"data,omitempty"` // hex calldata
+	// Solana: ephemeral private keys for additional signers (e.g. new account keypairs).
+	// These sign the final message after blockhash injection, alongside the TSS signature.
+	ExtraSignerKeys [][]byte `json:"-"` // each is a 64-byte ed25519 private key
 }
 
 // DecodedTx holds human-readable transaction info.
