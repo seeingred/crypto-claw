@@ -320,12 +320,6 @@ func TestBuildPartyConfigA(t *testing.T) {
 	if cfg.Transport.CertFile != "/etc/crypto-claw/cert.pem" {
 		t.Errorf("Transport.CertFile = %q", cfg.Transport.CertFile)
 	}
-	if len(cfg.Chains.EVM) != 1 {
-		t.Fatalf("expected 1 EVM chain, got %d", len(cfg.Chains.EVM))
-	}
-	if cfg.Chains.EVM[0].ChainID != 1 {
-		t.Errorf("EVM chain ID = %d, want 1", cfg.Chains.EVM[0].ChainID)
-	}
 }
 
 func TestBuildPartyConfigB(t *testing.T) {

@@ -80,14 +80,6 @@ func NewTestCluster(t *testing.T) *TestCluster {
 				KeyFile:    filepath.Join(certDirA, "key.pem"),
 				CACertFile: filepath.Join(certDirA, "ca.pem"),
 			},
-			Chains: config.ChainsConfig{
-				EVM: []config.EVMChainConfig{
-					{Name: "hardhat", ChainID: 31337, RPCURL: "http://127.0.0.1:8545"},
-				},
-				Solana: []config.SolanaChainConfig{
-					{Name: "local", RPCURL: "http://127.0.0.1:8899"},
-				},
-			},
 		},
 		KeyShare:      make(map[tss.Curve]*tss.KeyShare),
 		DerivedShares: make(map[string][]byte),

@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # Crypto Claw Uninstaller
-# Usage: curl -fsSL https://raw.githubusercontent.com/seeingred/crypto-claw/main/scripts/uninstall.sh | bash
+# Handles both Docker-based local installs and remote server installs.
 
 # ---------------------------------------------------------------------------
-# Colors and formatting
+# Colors
 # ---------------------------------------------------------------------------
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -19,6 +19,18 @@ success() { printf "${GREEN}[OK]${NC}    %s\n" "$*"; }
 warn()    { printf "${YELLOW}[WARN]${NC}  %s\n" "$*"; }
 error()   { printf "${RED}[ERROR]${NC} %s\n" "$*" >&2; }
 step()    { printf "\n${BOLD}--- %s ---${NC}\n" "$*"; }
+
+# ---------------------------------------------------------------------------
+# Constants (must match deploy.go)
+# ---------------------------------------------------------------------------
+CONTAINER_A="crypto-claw-party-a"
+CONTAINER_B="crypto-claw-party-b"
+CONTAINER_PG="crypto-claw-postgres"
+LOCAL_CONFIG_DIR="$HOME/.crypto-claw"
+REMOTE_CONFIG_DIR="/etc/crypto-claw"
+DB_USER="crypto_claw"
+DB_A="crypto_claw_a"
+DB_B="crypto_claw_b"
 
 # ---------------------------------------------------------------------------
 # Banner
@@ -38,16 +50,6 @@ BANNER
 printf "${NC}"
 
 # ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-INSTALL_DIR="${CRYPTO_CLAW_DIR:-$HOME/.crypto-claw}"
-CONTAINER_A="crypto-claw-party-a"
-CONTAINER_B="crypto-claw-party-b"
-IMAGE_A="crypto-claw-party-a"
-IMAGE_B="crypto-claw-party-b"
-CONFIG_DIR="/etc/crypto-claw"
-
-# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 prompt_yn() {
@@ -64,10 +66,8 @@ prompt_yn() {
     [[ "$reply" =~ ^[Yy]$ ]]
 }
 
-# Run a command on a remote host via SSH, or locally if host is "local".
 run_on() {
-    local host="$1"
-    shift
+    local host="$1"; shift
     if [ "$host" = "local" ]; then
         eval "$@"
     else
@@ -76,7 +76,170 @@ run_on() {
 }
 
 # ---------------------------------------------------------------------------
-# Detect installation mode (local vs remote)
+# Stop and remove Docker containers (party-a, party-b, postgres)
+# ---------------------------------------------------------------------------
+remove_containers() {
+    local host="$1"
+    step "Removing Docker containers on $host"
+
+    for container in "$CONTAINER_A" "$CONTAINER_B" "$CONTAINER_PG"; do
+        local exists
+        exists="$(run_on "$host" "docker ps -aq -f name='^${container}$'" 2>/dev/null || true)"
+        if [ -n "$exists" ]; then
+            info "Stopping and removing: $container"
+            run_on "$host" "docker stop '$container' 2>/dev/null; docker rm -f '$container' 2>/dev/null" \
+                && success "Removed $container" \
+                || warn "Could not remove $container"
+        else
+            info "Container $container not found. Skipping."
+        fi
+    done
+
+    # Kill legacy bare processes (pre-Docker installs).
+    if [ "$host" = "local" ]; then
+        for port in 8080 9000; do
+            local pids
+            pids="$(lsof -ti ":$port" 2>/dev/null || true)"
+            if [ -n "$pids" ]; then
+                info "Killing process on port $port (legacy)"
+                echo "$pids" | xargs kill 2>/dev/null || true
+            fi
+        done
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Remove Docker images
+# ---------------------------------------------------------------------------
+remove_images() {
+    local host="$1"
+    step "Removing Docker images on $host"
+
+    for image in "$CONTAINER_A" "$CONTAINER_B"; do
+        local image_id
+        image_id="$(run_on "$host" "docker images -q '${image}'" 2>/dev/null || true)"
+        if [ -n "$image_id" ]; then
+            info "Removing image: $image"
+            run_on "$host" "docker rmi -f '$image'" 2>/dev/null \
+                && success "Removed image $image" \
+                || warn "Could not remove image $image"
+        else
+            info "Image $image not found. Skipping."
+        fi
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Remove config directories
+# ---------------------------------------------------------------------------
+remove_config() {
+    local host="$1"
+    step "Removing configuration on $host"
+
+    # Local mode uses ~/.crypto-claw, remote uses /etc/crypto-claw.
+    local dirs=("$REMOTE_CONFIG_DIR")
+    if [ "$host" = "local" ]; then
+        dirs=("$LOCAL_CONFIG_DIR")
+    fi
+
+    for dir in "${dirs[@]}"; do
+        local dir_exists
+        dir_exists="$(run_on "$host" "test -d '$dir' && echo yes || echo no" 2>/dev/null || echo "no")"
+        if [ "$dir_exists" = "yes" ]; then
+            info "Found config directory: $dir"
+            if prompt_yn "  Remove $dir?"; then
+                run_on "$host" "rm -rf '$dir'" 2>/dev/null \
+                    && success "Removed $dir" \
+                    || { run_on "$host" "sudo rm -rf '$dir'" 2>/dev/null \
+                        && success "Removed $dir (sudo)" \
+                        || warn "Could not remove $dir"; }
+            else
+                info "Keeping $dir"
+            fi
+        else
+            info "Config directory $dir not found. Skipping."
+        fi
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Remove databases
+# ---------------------------------------------------------------------------
+remove_database() {
+    local host="$1"
+    step "Database cleanup on $host"
+
+    info "Crypto Claw databases: $DB_A, $DB_B (user: $DB_USER)"
+    warn "Dropping databases will permanently destroy key shares and audit logs."
+    echo ""
+
+    if ! prompt_yn "  Drop Crypto Claw databases on $host?"; then
+        info "Keeping databases."
+        return
+    fi
+
+    printf "  ${RED}${BOLD}WARNING: This action is irreversible.${NC}\n"
+    read -rp "  Type 'yes' to confirm: " confirm
+    if [ "$confirm" != "yes" ]; then
+        info "Aborted database deletion."
+        return
+    fi
+
+    info "Dropping databases..."
+
+    # Try via our Docker postgres container first.
+    local pg_running
+    pg_running="$(run_on "$host" "docker ps -q -f name='^${CONTAINER_PG}$'" 2>/dev/null || true)"
+
+    if [ -n "$pg_running" ]; then
+        info "Using Docker postgres container ($CONTAINER_PG)"
+        for db in "$DB_A" "$DB_B"; do
+            run_on "$host" "docker exec '$CONTAINER_PG' psql -U '$DB_USER' -c 'DROP DATABASE IF EXISTS $db;'" 2>/dev/null \
+                && success "Dropped $db" \
+                || warn "Could not drop $db"
+        done
+        return
+    fi
+
+    # Try any other running postgres container.
+    local any_pg
+    any_pg="$(run_on "$host" "docker ps -q -f ancestor=postgres" 2>/dev/null | head -1 || true)"
+    if [ -n "$any_pg" ]; then
+        info "Using postgres container $any_pg"
+        for db in "$DB_A" "$DB_B"; do
+            run_on "$host" "docker exec '$any_pg' psql -U postgres -c 'DROP DATABASE IF EXISTS $db;'" 2>/dev/null \
+                && success "Dropped $db" \
+                || warn "Could not drop $db"
+        done
+        run_on "$host" "docker exec '$any_pg' psql -U postgres -c \"DROP USER IF EXISTS $DB_USER;\"" 2>/dev/null \
+            && success "Dropped user $DB_USER" \
+            || warn "Could not drop user $DB_USER"
+        return
+    fi
+
+    # Try host psql.
+    if run_on "$host" "command -v psql" &>/dev/null; then
+        info "Using host psql"
+        for db in "$DB_A" "$DB_B"; do
+            run_on "$host" "psql -c 'DROP DATABASE IF EXISTS $db;' postgres" 2>/dev/null \
+                && success "Dropped $db" \
+                || warn "Could not drop $db"
+        done
+        run_on "$host" "psql -c \"DROP USER IF EXISTS $DB_USER;\" postgres" 2>/dev/null \
+            && success "Dropped user $DB_USER" \
+            || warn "Could not drop user $DB_USER"
+        return
+    fi
+
+    warn "No PostgreSQL client found on $host."
+    warn "Manually run:"
+    echo "    DROP DATABASE IF EXISTS $DB_A;"
+    echo "    DROP DATABASE IF EXISTS $DB_B;"
+    echo "    DROP USER IF EXISTS $DB_USER;"
+}
+
+# ---------------------------------------------------------------------------
+# Detect targets
 # ---------------------------------------------------------------------------
 TARGETS=()
 
@@ -85,198 +248,24 @@ detect_or_prompt_targets() {
     info "Crypto Claw can be installed locally or on remote servers."
     echo ""
 
-    if prompt_yn "Uninstall from local machine?"; then
+    if prompt_yn "Uninstall from local machine?" "y"; then
         TARGETS+=("local")
     fi
 
     if prompt_yn "Uninstall from remote servers via SSH?"; then
         echo ""
-        read -rp "  SSH address for Party A server (e.g. user@host or user@host:port): " server_a
-        if [ -n "$server_a" ]; then
-            TARGETS+=("$server_a")
-        fi
+        read -rp "  SSH address for Party A (e.g. user@host): " server_a
+        [ -n "$server_a" ] && TARGETS+=("$server_a")
 
-        read -rp "  SSH address for Party B server (e.g. user@host or user@host:port): " server_b
-        if [ -n "$server_b" ]; then
-            # Avoid adding duplicate if both parties are on the same host
-            if [ "$server_b" != "$server_a" ]; then
-                TARGETS+=("$server_b")
-            else
-                info "Party B is on the same host as Party A. Will clean up both on one pass."
-            fi
+        read -rp "  SSH address for Party B (e.g. user@host): " server_b
+        if [ -n "$server_b" ] && [ "$server_b" != "$server_a" ]; then
+            TARGETS+=("$server_b")
         fi
     fi
 
     if [ ${#TARGETS[@]} -eq 0 ]; then
         warn "No targets selected. Nothing to do."
         exit 0
-    fi
-}
-
-# ---------------------------------------------------------------------------
-# Stop and remove Docker containers
-# ---------------------------------------------------------------------------
-remove_containers() {
-    local host="$1"
-
-    step "Removing Docker containers on $host"
-
-    for container in "$CONTAINER_A" "$CONTAINER_B"; do
-        local running
-        running="$(run_on "$host" "docker ps -q -f name='^${container}$'" 2>/dev/null || true)"
-
-        if [ -n "$running" ]; then
-            info "Stopping container: $container"
-            run_on "$host" "docker stop '$container'" 2>/dev/null && success "Stopped $container" || warn "Could not stop $container"
-        fi
-
-        local exists
-        exists="$(run_on "$host" "docker ps -aq -f name='^${container}$'" 2>/dev/null || true)"
-
-        if [ -n "$exists" ]; then
-            info "Removing container: $container"
-            run_on "$host" "docker rm -f '$container'" 2>/dev/null && success "Removed $container" || warn "Could not remove $container"
-        else
-            info "Container $container does not exist. Skipping."
-        fi
-    done
-}
-
-# ---------------------------------------------------------------------------
-# Remove Docker images
-# ---------------------------------------------------------------------------
-remove_images() {
-    local host="$1"
-
-    step "Removing Docker images on $host"
-
-    for image in "$IMAGE_A" "$IMAGE_B"; do
-        local image_id
-        image_id="$(run_on "$host" "docker images -q '$image'" 2>/dev/null || true)"
-
-        if [ -n "$image_id" ]; then
-            info "Removing image: $image"
-            run_on "$host" "docker rmi -f '$image'" 2>/dev/null && success "Removed image $image" || warn "Could not remove image $image"
-        else
-            info "Image $image not found. Skipping."
-        fi
-    done
-}
-
-# ---------------------------------------------------------------------------
-# Remove config directory
-# ---------------------------------------------------------------------------
-remove_config() {
-    local host="$1"
-
-    step "Removing configuration on $host"
-
-    local dir_exists
-    dir_exists="$(run_on "$host" "test -d '$CONFIG_DIR' && echo yes || echo no" 2>/dev/null || echo "no")"
-
-    if [ "$dir_exists" = "yes" ]; then
-        info "Found config directory: $CONFIG_DIR"
-        if prompt_yn "  Remove $CONFIG_DIR on $host?"; then
-            run_on "$host" "sudo rm -rf '$CONFIG_DIR'" 2>/dev/null \
-                && success "Removed $CONFIG_DIR" \
-                || warn "Could not remove $CONFIG_DIR (may need elevated permissions)"
-        else
-            info "Keeping $CONFIG_DIR"
-        fi
-    else
-        info "Config directory $CONFIG_DIR not found on $host. Skipping."
-    fi
-}
-
-# ---------------------------------------------------------------------------
-# Remove database (optional)
-# ---------------------------------------------------------------------------
-remove_database() {
-    local host="$1"
-
-    step "Database cleanup on $host"
-
-    info "Crypto Claw stores key shares and transaction data in PostgreSQL."
-    warn "Dropping databases will permanently destroy key shares and audit logs."
-    echo ""
-
-    if ! prompt_yn "  Drop Crypto Claw databases (cclaw_a, cclaw_b) on $host?"; then
-        info "Keeping databases."
-        return
-    fi
-
-    echo ""
-    printf "  ${RED}${BOLD}WARNING: This action is irreversible.${NC}\n"
-    read -rp "  Type 'yes' to confirm database deletion: " confirm
-    if [ "$confirm" != "yes" ]; then
-        info "Aborted database deletion."
-        return
-    fi
-
-    info "Attempting to drop databases..."
-
-    # Try dropping via docker exec on a running postgres container first
-    local pg_container
-    pg_container="$(run_on "$host" "docker ps -q -f name=postgres -f name=crypto-claw-db" 2>/dev/null | head -1 || true)"
-
-    if [ -n "$pg_container" ]; then
-        run_on "$host" "docker exec '$pg_container' psql -U postgres -c 'DROP DATABASE IF EXISTS cclaw_a;'" 2>/dev/null \
-            && success "Dropped database cclaw_a" \
-            || warn "Could not drop cclaw_a"
-        run_on "$host" "docker exec '$pg_container' psql -U postgres -c 'DROP DATABASE IF EXISTS cclaw_b;'" 2>/dev/null \
-            && success "Dropped database cclaw_b" \
-            || warn "Could not drop cclaw_b"
-        run_on "$host" "docker exec '$pg_container' psql -U postgres -c \"DROP USER IF EXISTS cclaw;\"" 2>/dev/null \
-            && success "Dropped user cclaw" \
-            || warn "Could not drop user cclaw"
-    else
-        # Try local psql
-        if run_on "$host" "command -v psql" &>/dev/null; then
-            run_on "$host" "psql -U postgres -c 'DROP DATABASE IF EXISTS cclaw_a;'" 2>/dev/null \
-                && success "Dropped database cclaw_a" \
-                || warn "Could not drop cclaw_a (check PostgreSQL access)"
-            run_on "$host" "psql -U postgres -c 'DROP DATABASE IF EXISTS cclaw_b;'" 2>/dev/null \
-                && success "Dropped database cclaw_b" \
-                || warn "Could not drop cclaw_b (check PostgreSQL access)"
-            run_on "$host" "psql -U postgres -c \"DROP USER IF EXISTS cclaw;\"" 2>/dev/null \
-                && success "Dropped user cclaw" \
-                || warn "Could not drop user cclaw"
-        else
-            warn "No PostgreSQL client found on $host."
-            warn "Manually connect to PostgreSQL and run:"
-            echo "    DROP DATABASE IF EXISTS cclaw_a;"
-            echo "    DROP DATABASE IF EXISTS cclaw_b;"
-            echo "    DROP USER IF EXISTS cclaw;"
-        fi
-    fi
-}
-
-# ---------------------------------------------------------------------------
-# Remove local installation directory
-# ---------------------------------------------------------------------------
-remove_local_install() {
-    step "Removing local installation directory"
-
-    if [ -d "$INSTALL_DIR" ]; then
-        info "Found installation at: $INSTALL_DIR"
-        echo ""
-        warn "This directory contains source code, binaries, certificates, and configuration."
-        echo ""
-
-        if prompt_yn "  Remove $INSTALL_DIR and all its contents?"; then
-            printf "  ${RED}${BOLD}WARNING: This will delete key shares and certificates!${NC}\n"
-            read -rp "  Type 'yes' to confirm: " confirm
-            if [ "$confirm" = "yes" ]; then
-                rm -rf "$INSTALL_DIR"
-                success "Removed $INSTALL_DIR"
-            else
-                info "Aborted. Keeping $INSTALL_DIR."
-            fi
-        else
-            info "Keeping $INSTALL_DIR"
-        fi
-    else
-        info "No local installation found at $INSTALL_DIR"
     fi
 }
 
@@ -291,7 +280,6 @@ process_target() {
     printf "${BOLD}  Processing: %s${NC}\n" "$host"
     printf "${BOLD}========================================${NC}\n"
 
-    # Verify connectivity for remote hosts
     if [ "$host" != "local" ]; then
         info "Testing SSH connection to $host..."
         if ! ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$host" "echo ok" &>/dev/null; then
@@ -301,7 +289,6 @@ process_target() {
         success "SSH connection established."
     fi
 
-    # Check if Docker is available on target
     if run_on "$host" "command -v docker" &>/dev/null; then
         remove_containers "$host"
         remove_images "$host"
@@ -311,10 +298,6 @@ process_target() {
 
     remove_config "$host"
     remove_database "$host"
-
-    if [ "$host" = "local" ]; then
-        remove_local_install
-    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -324,7 +307,7 @@ main() {
     detect_or_prompt_targets
 
     echo ""
-    info "Targets to process: ${TARGETS[*]}"
+    info "Targets: ${TARGETS[*]}"
 
     if ! prompt_yn "Proceed with uninstallation?"; then
         info "Aborted."
@@ -339,8 +322,6 @@ main() {
     printf "${BOLD}${GREEN}============================================${NC}\n"
     printf "${BOLD}${GREEN}  Uninstallation complete.${NC}\n"
     printf "${BOLD}${GREEN}============================================${NC}\n"
-    echo ""
-    info "If you had custom firewall rules for Crypto Claw, you may want to remove those manually."
     echo ""
 }
 

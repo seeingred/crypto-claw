@@ -67,13 +67,7 @@ func main() {
 	registry.Register([]string{"60"}, evm.New())
 	registry.Register([]string{"501"}, solana.New())
 
-	// Use config prefix/denom if available, otherwise defaults.
-	tmPrefix, tmDenom := "", ""
-	if len(cfg.Chains.Tendermint) > 0 {
-		tmPrefix = cfg.Chains.Tendermint[0].Prefix
-		tmDenom = cfg.Chains.Tendermint[0].Denom
-	}
-	registry.Register([]string{"118"}, tendermint.New(tmPrefix, tmDenom))
+	registry.Register([]string{"118"}, tendermint.New("", ""))
 
 	// Create transport adapter.
 	tc := &transportAdapter{client: client}

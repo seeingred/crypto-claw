@@ -408,11 +408,6 @@ func buildLocalDockerConfig(state *WizardState, party string) *config.Config {
 		}
 		// Party A connects to Party B via host network.
 		cfg.Transport.RemoteAddr = "host.docker.internal:9000"
-		cfg.Chains = config.ChainsConfig{
-			EVM: []config.EVMChainConfig{
-				{Name: "ethereum", ChainID: 1, RPCURL: "https://eth.llamarpc.com"},
-			},
-		}
 	} else {
 		cfg.Transport.ListenAddr = "0.0.0.0:9000"
 
@@ -827,11 +822,6 @@ func buildPartyConfig(state *WizardState, party string, certDir string) *config.
 			cfg.Transport.RemoteAddr = "127.0.0.1:9000"
 		} else {
 			cfg.Transport.RemoteAddr = fmt.Sprintf("%s:9000", state.ServerB.Host)
-		}
-		cfg.Chains = config.ChainsConfig{
-			EVM: []config.EVMChainConfig{
-				{Name: "ethereum", ChainID: 1, RPCURL: "https://eth.llamarpc.com"},
-			},
 		}
 	} else {
 		// Party B listens for connections.

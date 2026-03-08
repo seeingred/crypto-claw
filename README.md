@@ -2,36 +2,31 @@
 
 A 2-of-2 Multi-Party Computation Threshold Signature Scheme (MPC-TSS) service that splits signing capability across two independent servers. Neither server alone can produce a valid signature, protecting against key theft even if one server is compromised.
 
+<p align="center">
+  <img src="screenshot.png" alt="Crypto Claw Installer" width="700" />
+</p>
+
 ## Quick Start
 
-### From the repo (recommended for development)
-
 ```bash
+# Build the frontend (requires Node.js 18+)
+cd installer/ui && npm install && npm run build && cd ../..
+cp -r installer/ui/dist/* cmd/installer/ui/dist/
+
+# Run the installer
 go run ./cmd/installer
 ```
 
-Opens the installer wizard at http://localhost:3000. The Svelte UI is pre-built and embedded in the Go binary — no Node.js needed.
+Opens the installer wizard at http://localhost:3000.
 
 ### Build a standalone binary
 
 ```bash
-# Build the frontend (requires Node.js 18+, only needed if you modify the UI)
-cd installer/ui && npm install && npm run build && cd ../..
-cp -r installer/ui/dist/* cmd/installer/ui/dist/
-
-# Build the Go binary (embeds the UI via go:embed)
 go build -o crypto-claw-installer ./cmd/installer
-```
-
-Run it:
-
-```bash
 ./crypto-claw-installer                  # default port 3000
 ./crypto-claw-installer -port 8888       # custom port
 ./crypto-claw-installer -no-browser      # don't auto-open browser
 ```
-
-If you haven't changed the Svelte UI, skip the frontend build — the pre-built `cmd/installer/ui/dist/` is already committed.
 
 ### Remote install (no repo checkout)
 
@@ -43,34 +38,9 @@ This clones the repo, builds the binary, and launches the wizard. Requires Go 1.
 
 ## Architecture
 
-```
-                          ┌────────────────────────────────────┐
-                          │         AI SERVER (exposed)         │
-  ┌──────────┐   REST     │                                    │
-  │  AI Bot  │───────────►│   TSS Signer Service (Party A)     │
-  │          │            │   - Stores public keys & paths     │
-  │ (out of  │  localhost │   - Receives sign requests         │
-  │  scope)  │◄───────────│   - Constructs chain-specific txs  │
-  └──────────┘            │   - Initiates TSS protocol         │
-       │                  │   - Returns signed tx to bot       │
-       │                  └───────────────┬────────────────────┘
-       │                                  │ mutual TLS
-       │                  ┌───────────────┴────────────────────┐
-       │                  │      SECURE SERVER (hardened)        │
-       │                  │                                     │
-       │                  │   TSS Co-signer Service (Party B)   │
-       │                  │   - Receives signing requests       │
-       │                  │   - Runs TX analyzer AI             │
-       │                  │   - Co-signs or rejects             │
-       │                  │   - Escalates uncertain txs to user │
-       │                  └─────────────────────────────────────┘
-       │
-       │  Bot broadcasts signed tx to chain RPC
-       ▼
-  ┌──────────┐
-  │Blockchain│
-  └──────────┘
-```
+<p align="center">
+  <img src="schema.png" alt="Crypto Claw Architecture" width="700" />
+</p>
 
 **Party A** (AI server) exposes a localhost REST API for the bot. It builds chain-specific transactions, initiates TSS signing with Party B, and returns signed transactions.
 
@@ -151,80 +121,6 @@ Connects to both servers, stops and removes Docker containers and images, cleans
 
 Both services are configured via a JSON file (`config.json`). See `internal/config/config.go` for the full schema. The installer wizard generates these automatically.
 
-### Party A (config-a.json)
-
-```json
-{
-  "party": "a",
-  "dataDir": "/var/lib/crypto-claw/party-a",
-  "database": {
-    "host": "localhost",
-    "port": 5432,
-    "user": "cclaw",
-    "password": "secret",
-    "dbName": "cclaw_a",
-    "sslMode": "disable"
-  },
-  "api": {
-    "listenAddr": "127.0.0.1:8080"
-  },
-  "transport": {
-    "remoteAddr": "secure-server:9000",
-    "certFile": "/etc/crypto-claw/cert.pem",
-    "keyFile": "/etc/crypto-claw/key.pem",
-    "caCertFile": "/etc/crypto-claw/ca.pem"
-  },
-  "chains": {
-    "evm": [
-      { "name": "ethereum", "chainId": 1, "rpcUrl": "https://eth.llamarpc.com" }
-    ],
-    "solana": [
-      { "name": "solana-mainnet", "rpcUrl": "https://api.mainnet-beta.solana.com" }
-    ]
-  }
-}
-```
-
-### Party B (config-b.json)
-
-```json
-{
-  "party": "b",
-  "dataDir": "/var/lib/crypto-claw/party-b",
-  "database": {
-    "host": "localhost",
-    "port": 5432,
-    "user": "cclaw",
-    "password": "secret",
-    "dbName": "cclaw_b",
-    "sslMode": "disable"
-  },
-  "transport": {
-    "listenAddr": "0.0.0.0:9000",
-    "certFile": "/etc/crypto-claw/cert.pem",
-    "keyFile": "/etc/crypto-claw/key.pem",
-    "caCertFile": "/etc/crypto-claw/ca.pem"
-  },
-  "analyzer": {
-    "autoMode": true,
-    "disableAI": false,
-    "whitelist": [
-      { "address": "0x...", "label": "Treasury" }
-    ],
-    "llm": {
-      "provider": "anthropic",
-      "apiKey": "sk-ant-...",
-      "model": "claude-sonnet-4-20250514"
-    }
-  },
-  "telegram": {
-    "botToken": "123456:ABC-DEF...",
-    "authorizedUserId": 12345678,
-    "escalationTimeout": "5m"
-  }
-}
-```
-
 ## Running
 
 ### With the installer (recommended)
@@ -303,78 +199,28 @@ Request a transaction to be signed. The endpoint is chain-agnostic — the deriv
   "value": "1000000000",
   "rpcUrl": "https://api.mainnet-beta.solana.com"
 }
+
+// Cosmos example
+{
+  "derivationPath": "m/44'/118'/0'/0/0",
+  "to": ["cosmos1..."],
+  "value": "1000000",
+  "chainId": "cosmoshub-4",
+  "data": "uatom"
+}
 ```
 
 | Field | Required | Description |
 |-------|----------|-------------|
 | derivationPath | yes | BIP-44 path of the signing key |
 | to | yes | Recipient address(es) |
-| value | no | Amount in smallest unit (wei, lamports) |
-| data | no | Hex calldata (EVM) or mint address (Solana SPL) |
+| value | no | Amount in smallest unit (wei, lamports, uatom) |
+| data | no | Hex calldata (EVM), mint address (Solana SPL), or denom (Cosmos) |
 | chainId | no | EVM chain ID or Cosmos chain ID |
 | gasLimit, gasPrice, nonce | no | EVM-specific fields |
 | rpcUrl | no | Solana RPC URL — service fetches a fresh blockhash right before signing, avoiding expiry during Telegram approval. SSRF-protected (private IPs blocked in production) |
 
-```json
-// Response (approved)
-{ "signedTx": "0x...", "status": "signed" }
-
-// Response (escalated for review)
-{ "txId": "<uuid>", "status": "pending_review" }
-
-// Response (rejected)
-{ "status": "rejected", "reason": "..." }
-```
-
-### `GET /sign/:txId`
-
-Poll status of an escalated transaction.
-
-```json
-{
-  "txId": "...",
-  "status": "pending_review",  // or "approved", "rejected"
-  "signedTx": "<base64>"       // present when approved
-}
-```
-
-Once an approved transaction is retrieved, it is deleted from memory.
-
-### `GET /keys`
-
-List all derived keys.
-
-```json
-{
-  "keys": {
-    "m/44'/60'/0'/0/0": {
-      "address": "0x...",
-      "pubKey": "0x...",
-      "label": "My ETH wallet"
-    }
-  }
-}
-```
-
-### `PUT /keys/:derivationPath/label`
-
-Update the label for a derived key.
-
-```json
-// Request
-{ "label": "Updated label" }
-
-// Response
-{ "ok": true }
-```
-
-### `GET /health`
-
-Check service health.
-
-```json
-{ "status": "ok", "secureServerConnected": true }
-```
+See `internal/partya/api.go` for the full API reference including `GET /sign/:txId`, `GET /keys`, `PUT /keys/:derivationPath/label`, and `GET /health`.
 
 ## Signing Flow
 
@@ -400,6 +246,7 @@ Check service health.
 - **Compromised AI server**: attacker gets Party A's key share (useless alone), can send signing requests but cannot bypass Party B's validation
 - **Protection layers**: independent tx decoding and signable bytes verification, address whitelisting, deterministic checks, optional LLM analysis, user escalation via Telegram, mutual TLS transport
 - **Signable bytes verification**: Party B independently extracts the signable hash from the unsigned transaction and rejects if it doesn't match what Party A claimed — prevents signing tampered data
+- **Solana RPC SSRF protection**: RPC URLs provided in sign requests are validated — DNS is resolved first, private/reserved IP ranges (10.x, 172.16-31.x, 192.168.x, localhost, link-local) are blocked in production. Bypass via `ALLOW_LOCAL_RPC=1` for dev/testing only
 - **Key storage**: shares encrypted with AES-256-GCM in PostgreSQL
 - **Transport**: mutual TLS with self-signed CA; both parties pin each other's certificates
 - **Containers**: non-root user, read-only config mounts, no exposed ports beyond the required ones
@@ -440,4 +287,4 @@ Integration tests (Cases 2-4) require Hardhat and will skip automatically if it'
 
 ## License
 
-Proprietary.
+MIT

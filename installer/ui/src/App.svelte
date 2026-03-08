@@ -88,7 +88,7 @@
     class="border-t border-gray-200 dark:border-gray-800 py-4 px-4 text-center"
   >
     <p class="text-xs text-gray-400 dark:text-gray-500">
-      Crypto Claw Installer &mdash; Secure Threshold Signing for Crypto Trading
+      Crypto Claw Installer
     </p>
   </footer>
 </div>

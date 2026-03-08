@@ -17,7 +17,6 @@ type Config struct {
 	// Party A specific
 	API       APIConfig       `json:"api,omitempty"`
 	Transport TransportConfig `json:"transport"`
-	Chains    ChainsConfig    `json:"chains,omitempty"`
 
 	// Party B specific
 	Analyzer AnalyzerConfig `json:"analyzer,omitempty"`
@@ -54,33 +53,6 @@ type TransportConfig struct {
 	CertFile   string `json:"certFile"`
 	KeyFile    string `json:"keyFile"`
 	CACertFile string `json:"caCertFile"` // Peer's CA cert for pinning
-}
-
-type ChainsConfig struct {
-	EVM        []EVMChainConfig        `json:"evm,omitempty"`
-	Solana     []SolanaChainConfig     `json:"solana,omitempty"`
-	Tendermint []TendermintChainConfig `json:"tendermint,omitempty"`
-}
-
-type EVMChainConfig struct {
-	Name       string `json:"name"`    // e.g. "ethereum", "polygon"
-	ChainID    int64  `json:"chainId"` // e.g. 1, 137
-	RPCURL     string `json:"rpcUrl"`
-	ExplorerAPI string `json:"explorerApi,omitempty"` // e.g. etherscan API URL
-	ExplorerKey string `json:"explorerKey,omitempty"`
-}
-
-type SolanaChainConfig struct {
-	Name   string `json:"name"`   // e.g. "solana-mainnet"
-	RPCURL string `json:"rpcUrl"` // e.g. "https://api.mainnet-beta.solana.com"
-}
-
-type TendermintChainConfig struct {
-	Name    string `json:"name"`    // e.g. "cosmoshub"
-	ChainID string `json:"chainId"` // e.g. "cosmoshub-4"
-	RPCURL  string `json:"rpcUrl"`
-	Denom   string `json:"denom"` // e.g. "uatom"
-	Prefix  string `json:"prefix"` // e.g. "cosmos"
 }
 
 type AnalyzerConfig struct {
