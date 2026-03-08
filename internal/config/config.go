@@ -85,7 +85,7 @@ type TendermintChainConfig struct {
 
 type AnalyzerConfig struct {
 	LLM          LLMConfig         `json:"llm"`
-	AutoMode     bool              `json:"autoMode"`              // true = AI decides, false = manual approval
+	AutoMode     bool              `json:"autoMode"`              // true = auto-approve whitelisted addresses, false = manual approval for all
 	DisableAI    bool              `json:"disableAI,omitempty"`   // true = no LLM, deterministic + whitelist only
 	ExplorerAPIs map[string]string `json:"explorerApis,omitempty"` // chain -> API key
 	Whitelist    []WhitelistSeed   `json:"whitelist,omitempty"`   // seed addresses to pre-populate

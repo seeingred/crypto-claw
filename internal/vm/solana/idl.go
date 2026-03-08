@@ -526,11 +526,11 @@ func decompressIDL(data []byte, compression byte) ([]byte, error) {
 			return nil, fmt.Errorf("zlib open: %w", err)
 		}
 		defer r.Close()
-		return io.ReadAll(r)
+		return io.ReadAll(io.LimitReader(r, 2<<20)) // 2 MB decompression limit
 	default:
 		// Try zlib; fall back to raw.
 		if r, err := zlib.NewReader(bytes.NewReader(data)); err == nil {
-			decompressed, err := io.ReadAll(r)
+			decompressed, err := io.ReadAll(io.LimitReader(r, 2<<20))
 			r.Close()
 			if err == nil {
 				return decompressed, nil

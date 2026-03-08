@@ -71,8 +71,19 @@ func (b *Bot) AutoMode() bool {
 	return b.autoMode
 }
 
+// registerCommands sets the bot's command menu visible in Telegram UI.
+func (b *Bot) registerCommands() {
+	cmds := tgbotapi.NewSetMyCommands(
+		tgbotapi.BotCommand{Command: "settings", Description: "Configure auto/manual mode"},
+	)
+	if _, err := b.api.Request(cmds); err != nil {
+		b.logger.Error("failed to set bot commands", "err", err)
+	}
+}
+
 // Start begins listening for updates. Blocks until Stop is called.
 func (b *Bot) Start() {
+	b.registerCommands()
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 
@@ -138,7 +149,13 @@ func (b *Bot) SendSettingsMenu(chatID int64) error {
 	}
 	b.mu.RUnlock()
 
-	text := fmt.Sprintf("*Settings*\nCurrent mode: *%s*", mode)
+	text := fmt.Sprintf(
+		"*Settings*\nCurrent mode: *%s*\n\n"+
+			"*Auto* — Transactions to whitelisted addresses are signed automatically. "+
+			"You get a notification but no action needed. Unknown addresses still require your approval.\n\n"+
+			"*Manual* — Every transaction requires your explicit approval before signing.",
+		mode,
+	)
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = "Markdown"
 	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(

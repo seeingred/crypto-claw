@@ -542,7 +542,7 @@
       </h2>
       <p class="text-gray-600 dark:text-gray-400">
         Enter your recovery phrase to derive private keys for any path the bot used.
-        Import the keys into MetaMask to transfer funds to safety.
+        Import the keys into a compatible wallet to transfer funds to safety.
       </p>
     </div>
 
@@ -586,7 +586,7 @@
         Disaster Recovery
       </h2>
       <p class="text-gray-600 dark:text-gray-400">
-        Derive private keys for each path the bot used. Import into MetaMask to move funds.
+        Derive private keys for each path the bot used to move funds to safety.
       </p>
     </div>
 

@@ -117,7 +117,10 @@ func (b *Bot) editSettingsMessage(msg *tgbotapi.Message) {
 	}
 	b.mu.RUnlock()
 
-	text := "*Settings*\nCurrent mode: *" + mode + "*"
+	text := "*Settings*\nCurrent mode: *" + mode + "*\n\n" +
+		"*Auto* — Transactions to whitelisted addresses are signed automatically. " +
+		"You get a notification but no action needed. Unknown addresses still require your approval.\n\n" +
+		"*Manual* — Every transaction requires your explicit approval before signing."
 	edit := tgbotapi.NewEditMessageTextAndMarkup(
 		msg.Chat.ID,
 		msg.MessageID,

@@ -391,6 +391,7 @@ func validateRPCURL(rawURL string) error {
 // isPrivateIP returns true if the IP is in a private or reserved range.
 func isPrivateIP(ip net.IP) bool {
 	privateRanges := []string{
+		"0.0.0.0/8",      // "this" network
 		"127.0.0.0/8",    // loopback
 		"10.0.0.0/8",     // RFC 1918
 		"172.16.0.0/12",  // RFC 1918
@@ -399,6 +400,7 @@ func isPrivateIP(ip net.IP) bool {
 		"::1/128",        // IPv6 loopback
 		"fc00::/7",       // IPv6 unique local
 		"fe80::/10",      // IPv6 link-local
+		"::/128",         // IPv6 unspecified
 	}
 	for _, cidr := range privateRanges {
 		_, network, err := net.ParseCIDR(cidr)
