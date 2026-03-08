@@ -3,7 +3,7 @@
   import Card from '../components/Card.svelte';
   import Alert from '../components/Alert.svelte';
   import { currentStep, wizardState, deployLogs } from '../stores.js';
-  import { installRestore, installExport, startUpdate, subscribeDeployLogs } from '../api.js';
+  import { installRestore, installExport, startUpdate, subscribeDeployLogs, sweepSOL, sweepToken, fetchTokenAccounts } from '../api.js';
 
   let mode = $state('choose');
   let restoreMnemonic = $state('');
@@ -17,6 +17,12 @@
   let logContainer = $state(null);
   let unsubscribeLogs = null;
   let mnemonicValidated = $state(false);
+  let sweepDest = $state('');
+  let sweepRpc = $state('https://api.mainnet-beta.solana.com');
+  let sweepStatus = $state({}); // path -> { status: 'idle'|'sweeping'|'done'|'error', txid?, error? }
+  let tokenAccounts = $state({}); // path -> TokenAccountInfo[]
+  let tokenSweepStatus = $state({}); // "path:mint" -> { status, txid?, error? }
+  let loadingTokens = $state({}); // path -> bool
 
   function handleNewInstall() {
     wizardState.update((s) => ({ ...s, installMode: 'install' }));
@@ -92,13 +98,11 @@
 
   async function deriveAllDBPaths() {
     if (!exportResult?.dbAddresses?.length) return;
-    const ecdsaPaths = exportResult.dbAddresses
-      .filter(a => a.curve === 'secp256k1')
-      .map(a => a.path);
-    if (ecdsaPaths.length === 0) return;
+    const allPaths = exportResult.dbAddresses.map(a => a.path);
+    if (allPaths.length === 0) return;
     errorMsg = '';
     try {
-      const result = await installExport(exportMnemonic.trim(), ecdsaPaths);
+      const result = await installExport(exportMnemonic.trim(), allPaths);
       if (result.derivedKeys?.length > 0) {
         const existing = exportResult.derivedKeys || [];
         const existingPaths = new Set(existing.map(k => k.path));
@@ -115,6 +119,48 @@
 
   function copyToClipboard(text) {
     navigator.clipboard.writeText(text);
+  }
+
+  async function loadTokenAccounts(path, address) {
+    loadingTokens = { ...loadingTokens, [path]: true };
+    try {
+      const result = await fetchTokenAccounts(address, sweepRpc.trim());
+      tokenAccounts = { ...tokenAccounts, [path]: result.accounts || [] };
+    } catch (err) {
+      tokenAccounts = { ...tokenAccounts, [path]: [] };
+    }
+    loadingTokens = { ...loadingTokens, [path]: false };
+  }
+
+  async function handleTokenSweep(path, mint) {
+    if (!sweepDest.trim()) {
+      errorMsg = 'Enter a destination Solana address for sweep';
+      return;
+    }
+    errorMsg = '';
+    const key = `${path}:${mint}`;
+    tokenSweepStatus = { ...tokenSweepStatus, [key]: { status: 'sweeping' } };
+    try {
+      const result = await sweepToken(exportMnemonic.trim(), path, sweepDest.trim(), mint, sweepRpc.trim());
+      tokenSweepStatus = { ...tokenSweepStatus, [key]: { status: 'done', txid: result.txid } };
+    } catch (err) {
+      tokenSweepStatus = { ...tokenSweepStatus, [key]: { status: 'error', error: err.message || 'Token sweep failed' } };
+    }
+  }
+
+  async function handleSweep(path) {
+    if (!sweepDest.trim()) {
+      errorMsg = 'Enter a destination Solana address for sweep';
+      return;
+    }
+    errorMsg = '';
+    sweepStatus = { ...sweepStatus, [path]: { status: 'sweeping' } };
+    try {
+      const result = await sweepSOL(exportMnemonic.trim(), path, sweepDest.trim(), sweepRpc.trim());
+      sweepStatus = { ...sweepStatus, [path]: { status: 'done', txid: result.txid } };
+    } catch (err) {
+      sweepStatus = { ...sweepStatus, [path]: { status: 'error', error: err.message || 'Sweep failed' } };
+    }
   }
 
   async function submitRestore() {
@@ -543,17 +589,19 @@
         </Card>
       {/if}
 
-      <!-- Derive EVM keys by path -->
+      <!-- Derive keys by path -->
       <Card>
         <h3 class="text-lg font-semibold text-gray-900 dark:text-white mb-4 flex items-center gap-2">
           <span class="inline-flex items-center justify-center w-8 h-8 rounded-full bg-blue-100 dark:bg-blue-900/50">
-            <span class="text-blue-600 dark:text-blue-400 text-sm font-bold">E</span>
+            <span class="text-blue-600 dark:text-blue-400 text-sm font-bold">D</span>
           </span>
-          EVM / secp256k1 Keys
+          Derived Keys
         </h3>
 
         <p class="text-sm text-gray-600 dark:text-gray-400 mb-4">
-          Enter a derivation path to get the private key for that address. Use the same paths the bot derived (e.g. <code class="text-xs bg-gray-100 dark:bg-gray-800 px-1 rounded">m/44'/60'/0'/0/0</code>).
+          Enter a derivation path to get the private key for that address. Use the same paths the bot derived.
+          EVM: <code class="text-xs bg-gray-100 dark:bg-gray-800 px-1 rounded">m/44'/60'/0'/0/0</code>,
+          Solana: <code class="text-xs bg-gray-100 dark:bg-gray-800 px-1 rounded">m/44'/501'/0'/0/0</code>
         </p>
 
         <!-- Derive input -->
@@ -576,17 +624,47 @@
         {/if}
 
         <!-- DB paths hint -->
-        {#if exportResult?.dbAddresses?.length > 0 && (!exportResult?.derivedKeys || exportResult.derivedKeys.length === 0)}
-          <div class="mb-4 p-3 rounded-lg bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800">
-            <p class="text-sm text-blue-800 dark:text-blue-300 mb-2">
-              Found {exportResult.dbAddresses.filter(a => a.curve === 'secp256k1').length} EVM path(s) in the local database:
-            </p>
-            <div class="flex flex-wrap gap-1 mb-2">
-              {#each exportResult.dbAddresses.filter(a => a.curve === 'secp256k1') as addr}
-                <code class="text-xs bg-blue-100 dark:bg-blue-900/40 text-blue-800 dark:text-blue-200 px-2 py-0.5 rounded">{addr.path}</code>
-              {/each}
+        {#if exportResult?.dbAddresses?.length > 0}
+          {@const derivedPaths = new Set((exportResult?.derivedKeys || []).map(k => k.path))}
+          {@const underivedAddrs = exportResult.dbAddresses.filter(a => !derivedPaths.has(a.path))}
+          {#if underivedAddrs.length > 0}
+            <div class="mb-4 p-3 rounded-lg bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800">
+              <p class="text-sm text-blue-800 dark:text-blue-300 mb-2">
+                Found {underivedAddrs.length} path(s) in the local database:
+              </p>
+              <div class="flex flex-wrap gap-1 mb-2">
+                {#each underivedAddrs as addr}
+                  <code class="text-xs bg-blue-100 dark:bg-blue-900/40 text-blue-800 dark:text-blue-200 px-2 py-0.5 rounded">{addr.path} ({addr.curve})</code>
+                {/each}
+              </div>
+              <Button size="sm" onclick={deriveAllDBPaths}>Derive All DB Paths</Button>
             </div>
-            <Button size="sm" onclick={deriveAllDBPaths}>Derive All DB Paths</Button>
+          {/if}
+        {/if}
+
+        <!-- Sweep config (for SOL derived keys) -->
+        {@const hasSolKeys = (exportResult?.derivedKeys || []).some(k => k.curve === 'ed25519' && !k.error)}
+        {#if hasSolKeys}
+          <div class="mb-4 p-3 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800">
+            <p class="text-sm font-medium text-amber-800 dark:text-amber-300 mb-2">Solana Sweep Settings</p>
+            <div class="space-y-2">
+              <div>
+                <label class="block text-xs text-gray-600 dark:text-gray-400 mb-0.5">Destination Address</label>
+                <input
+                  bind:value={sweepDest}
+                  placeholder="Your Phantom/Solana wallet address"
+                  class="w-full px-3 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 text-gray-900 dark:text-white font-mono text-xs focus:ring-2 focus:ring-amber-500 focus:border-amber-500 outline-none"
+                />
+              </div>
+              <div>
+                <label class="block text-xs text-gray-600 dark:text-gray-400 mb-0.5">RPC URL</label>
+                <input
+                  bind:value={sweepRpc}
+                  placeholder="https://api.mainnet-beta.solana.com"
+                  class="w-full px-3 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 text-gray-900 dark:text-white font-mono text-xs focus:ring-2 focus:ring-amber-500 focus:border-amber-500 outline-none"
+                />
+              </div>
+            </div>
           </div>
         {/if}
 
@@ -596,7 +674,12 @@
             {#each exportResult.derivedKeys as key}
               <div class="p-3 rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900/50">
                 <div class="flex items-center justify-between mb-2">
-                  <code class="text-xs font-semibold text-gray-700 dark:text-gray-300">{key.path}</code>
+                  <div class="flex items-center gap-2">
+                    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium {key.curve === 'ed25519' ? 'bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300' : 'bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300'}">
+                      {key.curve === 'ed25519' ? 'SOL' : 'EVM'}
+                    </span>
+                    <code class="text-xs font-semibold text-gray-700 dark:text-gray-300">{key.path}</code>
+                  </div>
                   {#if key.error}
                     <span class="text-xs text-red-500">{key.error}</span>
                   {/if}
@@ -610,13 +693,88 @@
                         <button onclick={() => copyToClipboard(key.address)} class="shrink-0 px-2 py-1 text-xs rounded bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 transition-colors cursor-pointer">Copy</button>
                       </div>
                     </div>
-                    <div>
-                      <label class="block text-xs text-gray-500 dark:text-gray-400 mb-0.5">Private Key (import into MetaMask)</label>
-                      <div class="flex items-center gap-2">
-                        <code class="flex-1 text-xs bg-red-50 dark:bg-red-900/20 text-red-800 dark:text-red-300 px-2 py-1 rounded font-mono break-all">{key.privKeyHex}</code>
-                        <button onclick={() => copyToClipboard(key.privKeyHex)} class="shrink-0 px-2 py-1 text-xs rounded bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 transition-colors cursor-pointer">Copy</button>
+                    {#if key.curve === 'ed25519'}
+                      <!-- SOL: Can't export as standard keypair, offer sweep instead -->
+                      <div class="p-2 rounded bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 space-y-2">
+                        <p class="text-xs text-amber-700 dark:text-amber-300">
+                          TSS-derived Solana keys can't be imported into wallets. Use sweep to transfer funds.
+                        </p>
+
+                        <!-- SOL sweep -->
+                        <div class="flex items-center gap-2">
+                          {#if sweepStatus[key.path]?.status === 'done'}
+                            <div class="text-xs text-emerald-700 dark:text-emerald-300 flex-1">
+                              SOL swept! TX: <code class="break-all select-all">{sweepStatus[key.path].txid}</code>
+                              <button onclick={() => copyToClipboard(sweepStatus[key.path].txid)} class="ml-1 px-1.5 py-0.5 rounded bg-emerald-200 dark:bg-emerald-800 hover:bg-emerald-300 dark:hover:bg-emerald-700 transition-colors cursor-pointer">Copy</button>
+                            </div>
+                          {:else if sweepStatus[key.path]?.status === 'error'}
+                            <div class="text-xs text-red-600 dark:text-red-400 flex-1">{sweepStatus[key.path].error}</div>
+                            <button onclick={() => handleSweep(key.path)} class="shrink-0 px-3 py-1 text-xs rounded bg-amber-600 hover:bg-amber-700 text-white transition-colors cursor-pointer">Retry</button>
+                          {:else}
+                            <button
+                              onclick={() => handleSweep(key.path)}
+                              disabled={sweepStatus[key.path]?.status === 'sweeping'}
+                              class="px-3 py-1 text-xs rounded bg-amber-600 hover:bg-amber-700 text-white transition-colors cursor-pointer disabled:opacity-50"
+                            >
+                              {sweepStatus[key.path]?.status === 'sweeping' ? 'Sweeping...' : 'Sweep SOL'}
+                            </button>
+                          {/if}
+                        </div>
+
+                        <!-- Token accounts -->
+                        <div>
+                          {#if !tokenAccounts[key.path]}
+                            <button
+                              onclick={() => loadTokenAccounts(key.path, key.address)}
+                              disabled={loadingTokens[key.path]}
+                              class="px-3 py-1 text-xs rounded bg-purple-600 hover:bg-purple-700 text-white transition-colors cursor-pointer disabled:opacity-50"
+                            >
+                              {loadingTokens[key.path] ? 'Loading...' : 'Check Token Balances'}
+                            </button>
+                          {:else if tokenAccounts[key.path]?.length === 0}
+                            <p class="text-xs text-gray-500 dark:text-gray-400">No SPL tokens found.</p>
+                          {:else}
+                            <div class="space-y-1.5">
+                              {#each tokenAccounts[key.path] as token}
+                                {@const sweepKey = `${key.path}:${token.mint}`}
+                                <div class="flex items-center gap-2 p-1.5 rounded bg-white/60 dark:bg-gray-800/60">
+                                  <div class="flex-1 min-w-0">
+                                    <div class="text-xs font-mono truncate text-gray-700 dark:text-gray-300" title={token.mint}>{token.mint}</div>
+                                    <div class="text-xs text-gray-500">{token.amount} tokens ({token.program})</div>
+                                  </div>
+                                  {#if tokenSweepStatus[sweepKey]?.status === 'done'}
+                                    <div class="text-xs text-emerald-600 dark:text-emerald-400 shrink-0">
+                                      Done
+                                      <button onclick={() => copyToClipboard(tokenSweepStatus[sweepKey].txid)} class="ml-1 px-1 py-0.5 rounded bg-emerald-200 dark:bg-emerald-800 cursor-pointer">TX</button>
+                                    </div>
+                                  {:else if tokenSweepStatus[sweepKey]?.status === 'error'}
+                                    <div class="text-xs text-red-500 shrink-0 max-w-32 truncate" title={tokenSweepStatus[sweepKey].error}>{tokenSweepStatus[sweepKey].error}</div>
+                                    <button onclick={() => handleTokenSweep(key.path, token.mint)} class="shrink-0 px-2 py-0.5 text-xs rounded bg-purple-600 hover:bg-purple-700 text-white cursor-pointer">Retry</button>
+                                  {:else}
+                                    <button
+                                      onclick={() => handleTokenSweep(key.path, token.mint)}
+                                      disabled={tokenSweepStatus[sweepKey]?.status === 'sweeping'}
+                                      class="shrink-0 px-2 py-0.5 text-xs rounded bg-purple-600 hover:bg-purple-700 text-white transition-colors cursor-pointer disabled:opacity-50"
+                                    >
+                                      {tokenSweepStatus[sweepKey]?.status === 'sweeping' ? '...' : 'Sweep'}
+                                    </button>
+                                  {/if}
+                                </div>
+                              {/each}
+                            </div>
+                          {/if}
+                        </div>
                       </div>
-                    </div>
+                    {:else}
+                      <!-- EVM: Standard private key export -->
+                      <div>
+                        <label class="block text-xs text-gray-500 dark:text-gray-400 mb-0.5">Private Key (import into MetaMask)</label>
+                        <div class="flex items-center gap-2">
+                          <code class="flex-1 text-xs bg-red-50 dark:bg-red-900/20 text-red-800 dark:text-red-300 px-2 py-1 rounded font-mono break-all">{key.privKeyHex}</code>
+                          <button onclick={() => copyToClipboard(key.privKeyHex)} class="shrink-0 px-2 py-1 text-xs rounded bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 transition-colors cursor-pointer">Copy</button>
+                        </div>
+                      </div>
+                    {/if}
                   </div>
                 {/if}
               </div>

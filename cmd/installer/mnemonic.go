@@ -288,6 +288,231 @@ func ExportSolanaKey(mnemonic string) (privKeyBase58, address string, err error)
 	return base58.Encode(keypair), base58.Encode(solPub), nil
 }
 
+// ExportSolanaKeyAtPath derives a Solana private key at an arbitrary path using
+// the same TSS-style non-hardened BIP-32 derivation that Party A's /derive uses.
+// This replicates the Edwards curve point arithmetic with the full private key.
+func ExportSolanaKeyAtPath(mnemonic, path string) (*DerivedKeyExport, error) {
+	if !bip39.IsMnemonicValid(mnemonic) {
+		return nil, fmt.Errorf("invalid mnemonic")
+	}
+
+	indices, err := parseBIP32Path(path)
+	if err != nil {
+		return nil, fmt.Errorf("parse path: %w", err)
+	}
+
+	seed := bip39.NewSeed(mnemonic, "")
+
+	// Derive SLIP-0010 master key at m/44'/501'/0'/0' (same as deriveEdDSAKey).
+	masterSeed, masterPub, masterCC, err := deriveEdDSAMaster(seed)
+	if err != nil {
+		return nil, fmt.Errorf("derive master: %w", err)
+	}
+
+	// The TSS master scalar is clamp(SHA-512(seed)[:32]).
+	h := sha512.Sum512(masterSeed)
+	h[0] &= 248
+	h[31] &= 127
+	h[31] |= 64
+	// Little-endian to big-endian for big.Int
+	reversed := make([]byte, 32)
+	for i := 0; i < 32; i++ {
+		reversed[i] = h[31-i]
+	}
+	scalar := new(big.Int).SetBytes(reversed)
+
+	// Edwards curve from tss-lib.
+	curve := tss.Edwards()
+	n := curve.Params().N
+
+	// Decode master public key into curve point (X, Y).
+	// Standard ed25519 pub: Y little-endian, sign of X in bit 255.
+	pubX, pubY := decodeEd25519PubKey(masterPub, curve)
+	chainCode := masterCC
+
+	// TSS-style non-hardened derivation at each level:
+	// HMAC-SHA512(chainCode, compressedPub || index) → il || ir
+	// child_scalar = parent_scalar + il mod l
+	// child_pub = parent_pub + il*B
+	for _, idx := range indices {
+		compressed := compressEdwardsPubKey(pubX, pubY)
+		data := make([]byte, 37)
+		copy(data[:33], compressed)
+		binary.BigEndian.PutUint32(data[33:], idx)
+
+		mac := hmac.New(sha512.New, chainCode)
+		mac.Write(data)
+		ilIr := mac.Sum(nil)
+		il := ilIr[:32]
+		ir := ilIr[32:]
+
+		ilInt := new(big.Int).SetBytes(il)
+		ilInt.Mod(ilInt, n)
+
+		scalar = new(big.Int).Add(scalar, ilInt)
+		scalar.Mod(scalar, n)
+
+		// il*B on Edwards curve
+		ilBytes := make([]byte, 32)
+		ilB := ilInt.Bytes()
+		copy(ilBytes[32-len(ilB):], ilB)
+		ilBx, ilBy := curve.ScalarBaseMult(ilBytes)
+		pubX, pubY = curve.Add(pubX, pubY, ilBx, ilBy)
+		chainCode = ir
+	}
+
+	// Convert scalar back to ed25519 seed-like 32 bytes (little-endian).
+	// We need to produce a valid ed25519 keypair for Phantom import.
+	// Since we have the scalar, we construct the keypair as [scalar_le || pubkey].
+	scalarBytes := scalar.Bytes() // big-endian
+	scalarLE := make([]byte, 32)
+	for i := 0; i < len(scalarBytes); i++ {
+		scalarLE[i] = scalarBytes[len(scalarBytes)-1-i]
+	}
+
+	// Encode derived public key.
+	pubKey := edwardsToEd25519PubKey(pubX, pubY)
+
+	// Phantom expects a 64-byte keypair: [seed || pubkey] or [scalar || pubkey].
+	// For TSS-derived keys the scalar is the signing key directly.
+	keypair := make([]byte, 64)
+	copy(keypair[:32], scalarLE)
+	copy(keypair[32:], pubKey)
+
+	return &DerivedKeyExport{
+		Path:       path,
+		PrivKeyHex: base58.Encode(keypair),
+		Address:    base58.Encode(pubKey),
+	}, nil
+}
+
+// deriveEdDSAMaster derives the SLIP-0010 ed25519 master key at m/44'/501'/0'/0'.
+// Returns the 32-byte seed, 32-byte public key, and 32-byte chain code.
+func deriveEdDSAMaster(seed []byte) ([]byte, []byte, []byte, error) {
+	mac := hmac.New(sha512.New, []byte("ed25519 seed"))
+	mac.Write(seed)
+	I := mac.Sum(nil)
+
+	key := make([]byte, 32)
+	copy(key, I[:32])
+	chainCode := make([]byte, 32)
+	copy(chainCode, I[32:])
+
+	// SLIP-0010 path: m/44'/501'/0'/0'
+	indices := []uint32{0x8000002C, 0x800001F5, 0x80000000, 0x80000000}
+	for _, index := range indices {
+		data := make([]byte, 37)
+		data[0] = 0x00
+		copy(data[1:33], key)
+		binary.BigEndian.PutUint32(data[33:], index)
+
+		mac := hmac.New(sha512.New, chainCode)
+		mac.Write(data)
+		I := mac.Sum(nil)
+
+		copy(key, I[:32])
+		copy(chainCode, I[32:])
+	}
+
+	privKey := ed25519.NewKeyFromSeed(key)
+	pubKey := make([]byte, ed25519.PublicKeySize)
+	copy(pubKey, privKey[ed25519.SeedSize:])
+
+	return key, pubKey, chainCode, nil
+}
+
+// decodeEd25519PubKey decodes a standard 32-byte ed25519 public key into Edwards curve X, Y.
+func decodeEd25519PubKey(pub []byte, curve elliptic.Curve) (*big.Int, *big.Int) {
+	// Y is stored little-endian, sign of X in bit 255.
+	signBit := pub[31] >> 7
+	yLE := make([]byte, 32)
+	copy(yLE, pub)
+	yLE[31] &= 0x7f // clear sign bit
+
+	// Little-endian to big-endian
+	yBE := make([]byte, 32)
+	for i := 0; i < 32; i++ {
+		yBE[i] = yLE[31-i]
+	}
+	y := new(big.Int).SetBytes(yBE)
+
+	// Recover X from Y using the Edwards curve equation.
+	// For ed25519: x^2 = (y^2 - 1) / (d*y^2 + 1) mod p
+	p := curve.Params().P
+	y2 := new(big.Int).Mul(y, y)
+	y2.Mod(y2, p)
+
+	// d = -121665/121666 mod p
+	d := new(big.Int).SetInt64(121666)
+	d.ModInverse(d, p)
+	d.Mul(d, big.NewInt(-121665))
+	d.Mod(d, p)
+
+	// numerator = y^2 - 1
+	num := new(big.Int).Sub(y2, big.NewInt(1))
+	num.Mod(num, p)
+
+	// denominator = d*y^2 + 1
+	den := new(big.Int).Mul(d, y2)
+	den.Add(den, big.NewInt(1))
+	den.Mod(den, p)
+
+	// x^2 = num/den mod p
+	denInv := new(big.Int).ModInverse(den, p)
+	x2 := new(big.Int).Mul(num, denInv)
+	x2.Mod(x2, p)
+
+	// x = sqrt(x2) mod p. p ≡ 5 mod 8, so x = x2^((p+3)/8) mod p.
+	exp := new(big.Int).Add(p, big.NewInt(3))
+	exp.Rsh(exp, 3) // (p+3)/8
+	x := new(big.Int).Exp(x2, exp, p)
+
+	// Verify: if x^2 != x2 mod p, multiply by sqrt(-1)
+	xCheck := new(big.Int).Mul(x, x)
+	xCheck.Mod(xCheck, p)
+	if xCheck.Cmp(x2) != 0 {
+		// sqrt(-1) = 2^((p-1)/4) mod p
+		sqrtM1Exp := new(big.Int).Sub(p, big.NewInt(1))
+		sqrtM1Exp.Rsh(sqrtM1Exp, 2)
+		sqrtM1 := new(big.Int).Exp(big.NewInt(2), sqrtM1Exp, p)
+		x.Mul(x, sqrtM1)
+		x.Mod(x, p)
+	}
+
+	// Fix sign
+	if x.Bit(0) != uint(signBit) {
+		x.Sub(p, x)
+	}
+
+	return x, y
+}
+
+// compressEdwardsPubKey produces SEC1-style compressed 33-byte key for HMAC input.
+func compressEdwardsPubKey(x, y *big.Int) []byte {
+	compressed := make([]byte, 33)
+	if y.Bit(0) == 0 {
+		compressed[0] = 0x02
+	} else {
+		compressed[0] = 0x03
+	}
+	xBytes := x.Bytes()
+	copy(compressed[33-len(xBytes):], xBytes)
+	return compressed
+}
+
+// edwardsToEd25519PubKey encodes Edwards curve point as standard 32-byte ed25519 public key.
+func edwardsToEd25519PubKey(x, y *big.Int) []byte {
+	yBytes := y.Bytes()
+	pubKey := make([]byte, 32)
+	for i := 0; i < len(yBytes); i++ {
+		pubKey[i] = yBytes[len(yBytes)-1-i]
+	}
+	if x.Bit(0) == 1 {
+		pubKey[31] |= 0x80
+	}
+	return pubKey
+}
+
 // parseBIP32Path parses "m/44'/60'/0'/0/0" into uint32 indices.
 func parseBIP32Path(path string) ([]uint32, error) {
 	if path == "" || path == "m" {

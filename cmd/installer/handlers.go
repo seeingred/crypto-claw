@@ -31,6 +31,9 @@ func registerAPIRoutes(mux *http.ServeMux, state *WizardState) {
 	mux.HandleFunc("POST /api/install/prepare", handleInstallPrepare(state))
 	mux.HandleFunc("POST /api/install/restore", handleInstallRestore(state))
 	mux.HandleFunc("POST /api/install/export", handleInstallExport(state))
+	mux.HandleFunc("POST /api/install/sweep", handleSweepSOL(state))
+	mux.HandleFunc("POST /api/install/sweep-token", handleSweepToken(state))
+	mux.HandleFunc("POST /api/install/token-accounts", handleTokenAccounts(state))
 	mux.HandleFunc("POST /api/deploy", handleDeploy(state))
 	mux.HandleFunc("POST /api/update", handleUpdate(state))
 	mux.HandleFunc("GET /api/deploy/logs", handleDeployLogs(state))
@@ -245,33 +248,51 @@ func handleInstallExport(state *WizardState) http.HandlerFunc {
 			return
 		}
 
-		// Try to find derived paths from DB if no paths provided.
+		// List derived paths from DB (returned to frontend for user to choose).
 		dbAddrs := listDerivedAddressesFromDB()
-		if len(req.Paths) == 0 && len(dbAddrs) > 0 {
-			for _, a := range dbAddrs {
-				if a["curve"] == "secp256k1" {
-					req.Paths = append(req.Paths, a["path"])
-				}
-			}
-		}
 
-		// Derive each requested ECDSA path using TSS-compatible derivation.
+		// Derive each requested path using TSS-compatible derivation.
 		var derivedKeys []map[string]string
 		for _, path := range req.Paths {
-			exported, err := DeriveECDSAKeyTSS(req.Mnemonic, path)
-			if err != nil {
-				slog.Warn("export: failed to derive path", "path", path, "error", err)
+			// Detect curve from coin type in path.
+			coinType := extractCoinTypeFromPath(path)
+			if coinType == "501" {
+				// Solana / ed25519 — use SLIP-0010 derivation.
+				exported, err := ExportSolanaKeyAtPath(req.Mnemonic, path)
+				if err != nil {
+					slog.Warn("export: failed to derive SOL path", "path", path, "error", err)
+					derivedKeys = append(derivedKeys, map[string]string{
+						"path":  path,
+						"curve": "ed25519",
+						"error": err.Error(),
+					})
+					continue
+				}
 				derivedKeys = append(derivedKeys, map[string]string{
-					"path":  path,
-					"error": err.Error(),
+					"path":       exported.Path,
+					"curve":      "ed25519",
+					"privKeyHex": exported.PrivKeyHex,
+					"address":    exported.Address,
 				})
-				continue
+			} else {
+				// EVM / secp256k1 — use TSS-compatible derivation.
+				exported, err := DeriveECDSAKeyTSS(req.Mnemonic, path)
+				if err != nil {
+					slog.Warn("export: failed to derive path", "path", path, "error", err)
+					derivedKeys = append(derivedKeys, map[string]string{
+						"path":  path,
+						"curve": "secp256k1",
+						"error": err.Error(),
+					})
+					continue
+				}
+				derivedKeys = append(derivedKeys, map[string]string{
+					"path":       exported.Path,
+					"curve":      "secp256k1",
+					"privKeyHex": exported.PrivKeyHex,
+					"address":    exported.Address,
+				})
 			}
-			derivedKeys = append(derivedKeys, map[string]string{
-				"path":       exported.Path,
-				"privKeyHex": exported.PrivKeyHex,
-				"address":    exported.Address,
-			})
 		}
 
 		slog.Info("wallet keys exported",
@@ -324,6 +345,119 @@ func listDerivedAddressesFromDB() []map[string]string {
 		})
 	}
 	return result
+}
+
+// handleSweepSOL sweeps all SOL from a TSS-derived Solana address to a destination.
+// TSS-derived ed25519 keys can't be exported as standard ed25519 keypairs (wallets
+// do SHA-512(seed) internally which is irreversible), so we sign directly with the
+// raw scalar and broadcast the transaction.
+func handleSweepSOL(state *WizardState) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Mnemonic    string `json:"mnemonic"`
+			Path        string `json:"path"`
+			Destination string `json:"destination"`
+			RpcURL      string `json:"rpcUrl"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+			return
+		}
+
+		req.Mnemonic = strings.TrimSpace(req.Mnemonic)
+		if req.Mnemonic == "" || req.Path == "" || req.Destination == "" || req.RpcURL == "" {
+			writeError(w, http.StatusBadRequest, "mnemonic, path, destination, and rpcUrl are required")
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+
+		txid, err := sweepSOL(ctx, req.Mnemonic, req.Path, req.Destination, req.RpcURL)
+		if err != nil {
+			slog.Error("sweep failed", "path", req.Path, "error", err)
+			writeError(w, http.StatusInternalServerError, "sweep failed: "+err.Error())
+			return
+		}
+
+		slog.Info("SOL sweep successful", "path", req.Path, "txid", txid)
+		writeJSON(w, http.StatusOK, map[string]string{
+			"status": "ok",
+			"txid":   txid,
+		})
+	}
+}
+
+// handleSweepToken sweeps all of an SPL token from a TSS-derived Solana address.
+func handleSweepToken(state *WizardState) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Mnemonic    string `json:"mnemonic"`
+			Path        string `json:"path"`
+			Destination string `json:"destination"`
+			Mint        string `json:"mint"`
+			RpcURL      string `json:"rpcUrl"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+			return
+		}
+
+		req.Mnemonic = strings.TrimSpace(req.Mnemonic)
+		if req.Mnemonic == "" || req.Path == "" || req.Destination == "" || req.Mint == "" || req.RpcURL == "" {
+			writeError(w, http.StatusBadRequest, "mnemonic, path, destination, mint, and rpcUrl are required")
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+
+		txid, err := sweepSPLToken(ctx, req.Mnemonic, req.Path, req.Destination, req.Mint, req.RpcURL)
+		if err != nil {
+			slog.Error("token sweep failed", "path", req.Path, "mint", req.Mint, "error", err)
+			writeError(w, http.StatusInternalServerError, "token sweep failed: "+err.Error())
+			return
+		}
+
+		slog.Info("token sweep successful", "path", req.Path, "mint", req.Mint, "txid", txid)
+		writeJSON(w, http.StatusOK, map[string]string{
+			"status": "ok",
+			"txid":   txid,
+		})
+	}
+}
+
+// handleTokenAccounts fetches all SPL token accounts for a derived Solana address.
+func handleTokenAccounts(state *WizardState) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Address string `json:"address"`
+			RpcURL  string `json:"rpcUrl"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+			return
+		}
+
+		if req.Address == "" || req.RpcURL == "" {
+			writeError(w, http.StatusBadRequest, "address and rpcUrl are required")
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		defer cancel()
+
+		accounts, err := getTokenAccounts(ctx, req.RpcURL, req.Address)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to fetch token accounts: "+err.Error())
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":   "ok",
+			"accounts": accounts,
+		})
+	}
 }
 
 // handleLLMSave saves the LLM provider configuration.
@@ -934,6 +1068,17 @@ func handleLocalhostSetup(state *WizardState) http.HandlerFunc {
 
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	}
+}
+
+// extractCoinTypeFromPath returns the coin type from a BIP-44 path (e.g. "60" from "m/44'/60'/0'/0/0").
+func extractCoinTypeFromPath(path string) string {
+	parts := strings.Split(strings.TrimPrefix(path, "m/"), "/")
+	if len(parts) < 2 {
+		return ""
+	}
+	ct := parts[1]
+	ct = strings.TrimRight(ct, "'hH")
+	return ct
 }
 
 // detectLLMProvider guesses the provider from the API key format.

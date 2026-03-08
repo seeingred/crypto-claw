@@ -139,6 +139,27 @@ export function subscribeDeployLogs(callback) {
   return () => evtSource.close();
 }
 
+export async function sweepSOL(mnemonic, path, destination, rpcUrl) {
+  return request('/install/sweep', {
+    method: 'POST',
+    body: JSON.stringify({ mnemonic, path, destination, rpcUrl }),
+  });
+}
+
+export async function sweepToken(mnemonic, path, destination, mint, rpcUrl) {
+  return request('/install/sweep-token', {
+    method: 'POST',
+    body: JSON.stringify({ mnemonic, path, destination, mint, rpcUrl }),
+  });
+}
+
+export async function fetchTokenAccounts(address, rpcUrl) {
+  return request('/install/token-accounts', {
+    method: 'POST',
+    body: JSON.stringify({ address, rpcUrl }),
+  });
+}
+
 export async function getState() {
   return request('/state', {
     method: 'GET',
