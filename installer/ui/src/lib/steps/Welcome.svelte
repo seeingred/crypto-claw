@@ -595,34 +595,6 @@
     </Alert>
 
     <div class="mt-6 space-y-6">
-      <!-- Solana Key (always one address since TSS doesn't derive EdDSA) -->
-      {#if exportResult?.solAddress}
-        <Card>
-          <h3 class="text-lg font-semibold text-gray-900 dark:text-white mb-4 flex items-center gap-2">
-            <span class="inline-flex items-center justify-center w-8 h-8 rounded-full bg-purple-100 dark:bg-purple-900/50">
-              <span class="text-purple-600 dark:text-purple-400 text-sm font-bold">S</span>
-            </span>
-            Solana (m/44'/501'/0'/0')
-          </h3>
-          <div class="space-y-3">
-            <div>
-              <label class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Address</label>
-              <div class="flex items-center gap-2">
-                <code class="flex-1 px-3 py-2 rounded-lg bg-gray-100 dark:bg-gray-900 text-sm text-gray-900 dark:text-gray-100 font-mono break-all">{exportResult.solAddress}</code>
-                <button onclick={() => copyToClipboard(exportResult.solAddress)} class="shrink-0 px-3 py-2 text-xs rounded-lg bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 transition-colors cursor-pointer">Copy</button>
-              </div>
-            </div>
-            <div>
-              <label class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Private Key (for Phantom)</label>
-              <div class="flex items-center gap-2">
-                <code class="flex-1 px-3 py-2 rounded-lg bg-red-50 dark:bg-red-900/20 text-sm text-red-800 dark:text-red-300 font-mono break-all">{exportResult.solPrivKey}</code>
-                <button onclick={() => copyToClipboard(exportResult.solPrivKey)} class="shrink-0 px-3 py-2 text-xs rounded-lg bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 transition-colors cursor-pointer">Copy</button>
-              </div>
-            </div>
-          </div>
-        </Card>
-      {/if}
-
       <!-- Derive keys by path -->
       <Card>
         <h3 class="text-lg font-semibold text-gray-900 dark:text-white mb-4 flex items-center gap-2">
