@@ -313,7 +313,7 @@ loop:
 	// Step 8: Verify local deployment files
 	// ---------------------------------------------------------------
 	t.Log("Step 8: Verify local deployment files")
-	baseDir := filepath.Join(os.TempDir(), "crypto-claw-local")
+	baseDir := localBaseDir()
 
 	for _, party := range []string{"a", "b"} {
 		partyDir := filepath.Join(baseDir, "party-"+party)

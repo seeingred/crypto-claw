@@ -42,6 +42,7 @@ const defaultState = {
       connected: false,
     },
   },
+  disableAI: false,
   llm: {
     provider: 'anthropic',
     apiKey: '',
@@ -132,10 +133,11 @@ export async function restoreState() {
       }
 
       if (backend.llmConfigured) {
+        updated.disableAI = !!backend.disableAI;
         updated.llm = {
           ...s.llm,
-          provider: backend.llmProvider || s.llm.provider,
-          model: backend.llmModel || s.llm.model,
+          provider: backend.disableAI ? '' : (backend.llmProvider || s.llm.provider),
+          model: backend.disableAI ? '' : (backend.llmModel || s.llm.model),
           localEndpoint: backend.llmEndpoint || '',
         };
       }

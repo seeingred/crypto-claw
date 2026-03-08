@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -25,6 +26,7 @@ func registerAPIRoutes(mux *http.ServeMux, state *WizardState) {
 	mux.HandleFunc("POST /api/servers/test", handleServersTest(state))
 	mux.HandleFunc("POST /api/servers/save", handleServersSave(state))
 	mux.HandleFunc("POST /api/llm/save", handleLLMSave(state))
+	mux.HandleFunc("POST /api/llm/test", handleLLMTest())
 	mux.HandleFunc("POST /api/llm/skip", handleLLMSkip(state))
 	mux.HandleFunc("POST /api/telegram/save", handleTelegramSave(state))
 	mux.HandleFunc("POST /api/telegram/verify", handleTelegramVerify(state))
@@ -38,6 +40,7 @@ func registerAPIRoutes(mux *http.ServeMux, state *WizardState) {
 	mux.HandleFunc("POST /api/update", handleUpdate(state))
 	mux.HandleFunc("GET /api/deploy/logs", handleDeployLogs(state))
 	mux.HandleFunc("GET /api/state", handleState(state))
+	mux.HandleFunc("GET /api/preflight", handlePreflight(state))
 	mux.HandleFunc("POST /api/localhost/setup", handleLocalhostSetup(state))
 }
 
@@ -548,7 +551,13 @@ func handleLLMSave(state *WizardState) http.HandlerFunc {
 		state.LLMProvider = req.Provider
 		state.LLMAPIKey = req.APIKey
 		state.LLMModel = req.Model
-		state.LLMEndpoint = req.Endpoint
+		// Only save custom endpoint for local provider — cloud providers
+		// use their default URLs and a stale endpoint would break them.
+		if req.Provider == "local" {
+			state.LLMEndpoint = req.Endpoint
+		} else {
+			state.LLMEndpoint = ""
+		}
 		state.Step = "llm"
 		state.mu.Unlock()
 
@@ -574,6 +583,193 @@ func handleLLMSkip(state *WizardState) http.HandlerFunc {
 
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	}
+}
+
+// handleLLMTest sends a minimal request to the LLM provider to verify the API key works.
+func handleLLMTest() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Provider string `json:"provider"`
+			APIKey   string `json:"apiKey"`
+			Model    string `json:"model"`
+			Endpoint string `json:"endpoint"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+
+		if req.Provider == "" {
+			writeError(w, http.StatusBadRequest, "provider is required")
+			return
+		}
+		if req.Provider != "local" && req.APIKey == "" {
+			writeError(w, http.StatusBadRequest, "API key is required")
+			return
+		}
+
+		// Auto-detect provider mismatch.
+		detected := detectLLMProvider(req.APIKey)
+		if detected != "" && detected != req.Provider {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf(
+				"API key looks like %s but you selected %s", detected, req.Provider))
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		defer cancel()
+
+		var testErr error
+		switch req.Provider {
+		case "anthropic":
+			testErr = testAnthropicKey(ctx, req.APIKey, req.Model)
+		case "openai":
+			testErr = testOpenAIKey(ctx, req.APIKey, req.Model)
+		case "local":
+			testErr = testLocalEndpoint(ctx, req.Endpoint, req.Model)
+		default:
+			writeError(w, http.StatusBadRequest, "unknown provider: "+req.Provider)
+			return
+		}
+
+		if testErr != nil {
+			slog.Warn("LLM test failed", "provider", req.Provider, "err", testErr)
+			writeJSON(w, http.StatusOK, map[string]any{
+				"success": false,
+				"error":   testErr.Error(),
+			})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{"success": true})
+	}
+}
+
+// testAnthropicKey sends a minimal messages request to the Anthropic API.
+func testAnthropicKey(ctx context.Context, apiKey, model string) error {
+	if model == "" {
+		model = "claude-haiku-4-5-20251001"
+	}
+	body := fmt.Sprintf(`{"model":"%s","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`, model)
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.anthropic.com/v1/messages", strings.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", apiKey)
+	req.Header.Set("anthropic-version", "2023-06-01")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("connection failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 401 {
+		return fmt.Errorf("invalid API key (401 Unauthorized)")
+	}
+	if resp.StatusCode == 403 {
+		return fmt.Errorf("API key lacks permission (403 Forbidden)")
+	}
+	if resp.StatusCode >= 400 {
+		var errResp struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		json.NewDecoder(resp.Body).Decode(&errResp)
+		if errResp.Error.Message != "" {
+			return fmt.Errorf("%s", errResp.Error.Message)
+		}
+		return fmt.Errorf("API returned status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// testOpenAIKey sends a minimal chat completion request to the OpenAI API.
+func testOpenAIKey(ctx context.Context, apiKey, model string) error {
+	if model == "" {
+		model = "gpt-4o-mini"
+	}
+	body := fmt.Sprintf(`{"model":"%s","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`, model)
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.openai.com/v1/chat/completions", strings.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("connection failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 401 {
+		return fmt.Errorf("invalid API key (401 Unauthorized)")
+	}
+	if resp.StatusCode == 403 {
+		return fmt.Errorf("API key lacks permission (403 Forbidden)")
+	}
+	if resp.StatusCode >= 400 {
+		var errResp struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		json.NewDecoder(resp.Body).Decode(&errResp)
+		if errResp.Error.Message != "" {
+			return fmt.Errorf("%s", errResp.Error.Message)
+		}
+		return fmt.Errorf("API returned status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// testLocalEndpoint tests a local LLM endpoint by trying Ollama's native API first,
+// then falling back to the OpenAI-compatible endpoint.
+func testLocalEndpoint(ctx context.Context, endpoint, model string) error {
+	if endpoint == "" {
+		return fmt.Errorf("endpoint URL is required")
+	}
+	if model == "" {
+		model = "default"
+	}
+	base := strings.TrimRight(endpoint, "/")
+
+	// Try Ollama native API first (/api/chat).
+	ollamaURL := base + "/api/chat"
+	ollamaBody := fmt.Sprintf(`{"model":"%s","messages":[{"role":"user","content":"ping"}],"stream":false}`, model)
+	if err := tryLocalRequest(ctx, ollamaURL, ollamaBody); err == nil {
+		return nil
+	}
+
+	// Fall back to OpenAI-compatible endpoint (/v1/chat/completions).
+	openaiURL := base + "/v1/chat/completions"
+	openaiBody := fmt.Sprintf(`{"model":"%s","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`, model)
+	if err := tryLocalRequest(ctx, openaiURL, openaiBody); err != nil {
+		return fmt.Errorf("endpoint not reachable (tried %s/api/chat and %s/v1/chat/completions): %w", base, base, err)
+	}
+	return nil
+}
+
+func tryLocalRequest(ctx context.Context, url, body string) error {
+	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("connection failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("status %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // handleTelegramSave validates the Telegram bot token via getMe and saves it.
@@ -804,6 +1000,12 @@ func handleDeploy(state *WizardState) http.HandlerFunc {
 			hostsA := []string{state.ServerA.Host}
 			hostsB := []string{state.ServerB.Host}
 			state.mu.Unlock()
+
+			// In local Docker mode, containers resolve each other via host.docker.internal.
+			if localMode {
+				hostsA = append(hostsA, "host.docker.internal")
+				hostsB = append(hostsB, "host.docker.internal")
+			}
 
 			bundle, err := GenerateCerts(hostsA, hostsB)
 			if err != nil {
@@ -1094,6 +1296,45 @@ func handleDeployLogs(state *WizardState) http.HandlerFunc {
 func handleState(state *WizardState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, state.SanitizedState())
+	}
+}
+
+// handlePreflight checks prerequisites before deployment (Docker, Postgres, etc.).
+func handlePreflight(state *WizardState) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		state.mu.Lock()
+		localMode := state.LocalMode
+		state.mu.Unlock()
+
+		checks := make(map[string]any)
+
+		if localMode {
+			// Check Docker — only hard requirement. Postgres is auto-deployed in Docker if needed.
+			dockerOk := false
+			dockerErr := ""
+			out, err := exec.Command("docker", "info").CombinedOutput()
+			if err != nil {
+				if strings.Contains(string(out), "Cannot connect") || strings.Contains(string(out), "no such file") || strings.Contains(err.Error(), "executable file not found") {
+					dockerErr = "Docker is not running. Please start Docker Desktop."
+				} else {
+					dockerErr = "Docker check failed: " + strings.TrimSpace(string(out))
+				}
+			} else {
+				dockerOk = true
+			}
+			checks["docker"] = map[string]any{"ok": dockerOk, "error": dockerErr}
+		}
+
+		allOk := true
+		for _, v := range checks {
+			if m, ok := v.(map[string]any); ok && !m["ok"].(bool) {
+				allOk = false
+				break
+			}
+		}
+		checks["ready"] = allOk
+
+		writeJSON(w, http.StatusOK, checks)
 	}
 }
 

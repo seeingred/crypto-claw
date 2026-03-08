@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -22,6 +24,7 @@ const (
 	remoteConfigDir = "/etc/crypto-claw"
 	containerNameA  = "crypto-claw-party-a"
 	containerNameB  = "crypto-claw-party-b"
+	containerNamePG = "crypto-claw-postgres"
 	dockerImage     = "ghcr.io/seeingred/crypto-claw"
 )
 
@@ -199,10 +202,24 @@ func buildFromSource(client *ssh.Client, party string, logFn func(string)) error
 	return nil
 }
 
-// DeployLocal deploys both parties locally without SSH (for testing/development).
-// It writes configs and certs to a temporary directory and starts processes.
+// localBaseDir returns ~/.crypto-claw as the persistent local config directory.
+func localBaseDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join(os.TempDir(), "crypto-claw")
+	}
+	return filepath.Join(home, ".crypto-claw")
+}
+
+// localDSN returns the host-side DSN for a local party database.
+func localDSN(party string) string {
+	return fmt.Sprintf("postgres://crypto_claw:crypto_claw@127.0.0.1:5432/crypto_claw_%s?sslmode=disable", party)
+}
+
+// DeployLocal deploys both parties locally using Docker containers.
+// Configs and certs are written to ~/.crypto-claw/ and mounted into containers.
 func DeployLocal(state *WizardState, logFn func(string)) error {
-	baseDir := filepath.Join(os.TempDir(), "crypto-claw-local")
+	baseDir := localBaseDir()
 	if err := os.MkdirAll(baseDir, 0700); err != nil {
 		return fmt.Errorf("create base dir: %w", err)
 	}
@@ -235,7 +252,14 @@ func DeployLocal(state *WizardState, logFn func(string)) error {
 			}
 		}
 
-		cfg := buildPartyConfig(state, party, partyDir)
+		// Write key shares to disk (for DB import).
+		logFn(fmt.Sprintf("[%s] Writing key shares...", party))
+		if err := writeKeyShares(state, party, partyDir); err != nil {
+			return fmt.Errorf("write key shares for party %s: %w", party, err)
+		}
+
+		// Config uses container-internal paths.
+		cfg := buildLocalDockerConfig(state, party)
 		cfgJSON, err := json.MarshalIndent(cfg, "", "  ")
 		if err != nil {
 			return fmt.Errorf("marshal config: %w", err)
@@ -245,118 +269,183 @@ func DeployLocal(state *WizardState, logFn func(string)) error {
 			return fmt.Errorf("write config: %w", err)
 		}
 
-		// Write key shares.
-		logFn(fmt.Sprintf("[%s] Writing key shares...", party))
-		if err := writeKeyShares(state, party, partyDir); err != nil {
-			return fmt.Errorf("write key shares for party %s: %w", party, err)
-		}
-
 		logFn(fmt.Sprintf("[%s] Configuration written to %s", party, partyDir))
 	}
 
-	// Skip starting processes if CRYPTO_CLAW_NO_PROCESSES is set (e.g. in tests).
+	// Skip starting containers if CRYPTO_CLAW_NO_PROCESSES is set (e.g. in tests).
 	if os.Getenv("CRYPTO_CLAW_NO_PROCESSES") != "" {
-		logFn("[local] Skipping process start (CRYPTO_CLAW_NO_PROCESSES set).")
+		logFn("[local] Skipping container start (CRYPTO_CLAW_NO_PROCESSES set).")
 		logFn("[local] Local deployment complete (config only).")
 		logFn(fmt.Sprintf("[local] Config directory: %s", baseDir))
 		return nil
 	}
 
-	// Kill any existing party processes from a previous install.
-	logFn("[local] Stopping any existing party processes...")
+	// Check Docker is available locally.
+	if _, err := exec.LookPath("docker"); err != nil {
+		return fmt.Errorf("docker not found — please install Docker Desktop")
+	}
+
+	// Stop any existing containers.
+	logFn("[local] Stopping any existing containers...")
 	killExistingParties(logFn)
 
-	// Ensure PostgreSQL databases exist for local mode.
+	// Ensure PostgreSQL databases exist.
 	logFn("[local] Setting up PostgreSQL databases...")
 	if err := ensureLocalPostgres(logFn); err != nil {
 		return fmt.Errorf("postgres setup: %w", err)
 	}
 
-	// Import key shares into PostgreSQL for each party.
+	// Import key shares into PostgreSQL (runs on host).
 	logFn("[local] Importing key shares into databases...")
 	for _, party := range []string{"a", "b"} {
 		partyDir := filepath.Join(baseDir, "party-"+party)
-		cfg := buildPartyConfig(state, party, partyDir)
-		if err := importSharesToDB(cfg.Database.DSN(), partyDir, logFn, party); err != nil {
+		if err := importSharesToDB(localDSN(party), partyDir, logFn, party); err != nil {
 			return fmt.Errorf("import shares for party %s: %w", party, err)
 		}
 	}
 
-	// In local mode, start processes directly.
-	logFn("[local] Starting Party B...")
-	partyBDir := filepath.Join(baseDir, "party-b")
-	cmdB := exec.Command("go", "run", "./cmd/party-b", "-config", filepath.Join(partyBDir, "config.json"))
-	cmdB.Dir = findProjectRoot()
-	cmdB.Env = append(os.Environ(), "ALLOW_LOCAL_RPC=1")
-	cmdB.Stdout = os.Stdout
-	cmdB.Stderr = os.Stderr
-	if err := cmdB.Start(); err != nil {
-		logFn(fmt.Sprintf("[local] WARNING: Could not start Party B process: %v", err))
-		logFn("[local] You can start it manually with: go run ./cmd/party-b -config " + filepath.Join(partyBDir, "config.json"))
-	} else {
-		logFn(fmt.Sprintf("[local] Party B started (PID %d)", cmdB.Process.Pid))
-	}
+	// Build Docker images locally from source.
+	projectRoot := findProjectRoot()
+	for _, party := range []string{"a", "b"} {
+		imageName := fmt.Sprintf("crypto-claw-party-%s:latest", party)
+		dockerfile := fmt.Sprintf("docker/Dockerfile.party-%s", party)
+		logFn(fmt.Sprintf("[local] Building Docker image %s...", imageName))
 
-	logFn("[local] Starting Party A...")
-	partyADir := filepath.Join(baseDir, "party-a")
-	cmdA := exec.Command("go", "run", "./cmd/party-a", "-config", filepath.Join(partyADir, "config.json"))
-	cmdA.Dir = findProjectRoot()
-	cmdA.Env = append(os.Environ(), "ALLOW_LOCAL_RPC=1")
-	cmdA.Stdout = os.Stdout
-	cmdA.Stderr = os.Stderr
-	if err := cmdA.Start(); err != nil {
-		logFn(fmt.Sprintf("[local] WARNING: Could not start Party A process: %v", err))
-		logFn("[local] You can start it manually with: go run ./cmd/party-a -config " + filepath.Join(partyADir, "config.json"))
-	} else {
-		logFn(fmt.Sprintf("[local] Party A started (PID %d)", cmdA.Process.Pid))
-	}
-
-	// Wait briefly and verify processes are still alive.
-	// Use channels to detect early exit — if `go run` exits within 5s, the process crashed.
-	waitExit := func(cmd *exec.Cmd, name string) <-chan error {
-		ch := make(chan error, 1)
-		if cmd == nil || cmd.Process == nil {
-			ch <- fmt.Errorf("%s was not started", name)
-			return ch
+		if err := dockerBuildWithLogs(projectRoot, dockerfile, imageName, logFn); err != nil {
+			return fmt.Errorf("build %s: %w", imageName, err)
 		}
-		go func() { ch <- cmd.Wait() }()
-		return ch
+		logFn(fmt.Sprintf("[local] Image %s built successfully.", imageName))
 	}
-	exitB := waitExit(cmdB, "Party B")
-	exitA := waitExit(cmdA, "Party A")
 
-	// Give processes 5s to start up. If they exit in that window, they crashed.
-	timer := time.NewTimer(5 * time.Second)
-	defer timer.Stop()
-	var procErrors []string
-	for i := 0; i < 2; i++ {
-		select {
-		case err := <-exitB:
-			exitB = nil // don't read again
-			procErrors = append(procErrors, fmt.Sprintf("Party B exited early: %v", err))
-		case err := <-exitA:
-			exitA = nil
-			procErrors = append(procErrors, fmt.Sprintf("Party A exited early: %v", err))
-		case <-timer.C:
-			i = 2 // break loop — processes survived the startup window
+	// Start containers.
+	for _, party := range []string{"b", "a"} { // B first (it listens)
+		partyDir := filepath.Join(baseDir, "party-"+party)
+		containerName := containerNameA
+		port := "8080"
+		if party == "b" {
+			containerName = containerNameB
+			port = "9000"
+		}
+		imageName := fmt.Sprintf("crypto-claw-party-%s:latest", party)
+
+		logFn(fmt.Sprintf("[local] Starting %s...", containerName))
+		cmd := exec.Command("docker", "run", "-d",
+			"--name", containerName,
+			"-v", partyDir+":"+remoteConfigDir+":ro",
+			"-p", port+":"+port,
+			"--add-host=host.docker.internal:host-gateway",
+			"-e", "ALLOW_LOCAL_RPC=1",
+			imageName,
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			logFn(fmt.Sprintf("[local] docker run output: %s", string(out)))
+			return fmt.Errorf("start %s: %w", containerName, err)
+		}
+		containerID := strings.TrimSpace(string(out))
+		if len(containerID) > 12 {
+			containerID = containerID[:12]
+		}
+		logFn(fmt.Sprintf("[local] %s started (container %s)", containerName, containerID))
+	}
+
+	// Verify containers are running after a brief startup.
+	time.Sleep(3 * time.Second)
+	var containerErrors []string
+	for _, name := range []string{containerNameB, containerNameA} {
+		out, err := exec.Command("docker", "inspect", "-f", "{{.State.Running}}", name).Output()
+		if err != nil || strings.TrimSpace(string(out)) != "true" {
+			logs, _, _ := dockerLogs(name, 20)
+			containerErrors = append(containerErrors, fmt.Sprintf("%s not running. Logs:\n%s", name, logs))
 		}
 	}
-	if len(procErrors) > 0 {
-		for _, e := range procErrors {
+	if len(containerErrors) > 0 {
+		for _, e := range containerErrors {
 			logFn(fmt.Sprintf("[local] ERROR: %s", e))
 		}
-		return fmt.Errorf("processes failed to stay running: %s", strings.Join(procErrors, "; "))
+		return fmt.Errorf("containers failed to start: %s", strings.Join(containerErrors, "; "))
 	}
 
 	logFn("[local] Local deployment complete.")
 	logFn(fmt.Sprintf("[local] Config directory: %s", baseDir))
+	logFn("[local] Containers: docker logs crypto-claw-party-a | docker logs crypto-claw-party-b")
 	return nil
 }
 
-// UpdateLocal restarts both parties locally without regenerating keys or config.
-// It rebuilds and restarts processes using the existing config directory.
+// buildLocalDockerConfig creates a config for local Docker deployment.
+// Uses container-internal paths and host.docker.internal for host services.
+func buildLocalDockerConfig(state *WizardState, party string) *config.Config {
+	cfg := &config.Config{
+		Party:   party,
+		DataDir: remoteConfigDir,
+		Database: config.DatabaseConfig{
+			Host:     "host.docker.internal",
+			Port:     5432,
+			User:     "crypto_claw",
+			Password: "crypto_claw",
+			DBName:   "crypto_claw_" + party,
+			SSLMode:  "disable",
+		},
+		Transport: config.TransportConfig{
+			CertFile:   filepath.Join(remoteConfigDir, "cert.pem"),
+			KeyFile:    filepath.Join(remoteConfigDir, "key.pem"),
+			CACertFile: filepath.Join(remoteConfigDir, "ca.pem"),
+		},
+	}
+
+	if party == "a" {
+		partyAAddr := state.PartyAAddr
+		if partyAAddr == "" || strings.HasPrefix(partyAAddr, "127.0.0.1:") {
+			// Inside a container, must bind to 0.0.0.0 to be reachable.
+			port := "8080"
+			if parts := strings.SplitN(partyAAddr, ":", 2); len(parts) == 2 {
+				port = parts[1]
+			}
+			partyAAddr = "0.0.0.0:" + port
+		}
+		cfg.API = config.APIConfig{
+			ListenAddr: partyAAddr,
+		}
+		// Party A connects to Party B via host network.
+		cfg.Transport.RemoteAddr = "host.docker.internal:9000"
+		cfg.Chains = config.ChainsConfig{
+			EVM: []config.EVMChainConfig{
+				{Name: "ethereum", ChainID: 1, RPCURL: "https://eth.llamarpc.com"},
+			},
+		}
+	} else {
+		cfg.Transport.ListenAddr = "0.0.0.0:9000"
+
+		// Rewrite localhost LLM endpoint to host.docker.internal so the
+		// container can reach the host-side Ollama/vLLM.
+		llmEndpoint := state.LLMEndpoint
+		if llmEndpoint != "" {
+			llmEndpoint = strings.Replace(llmEndpoint, "localhost", "host.docker.internal", 1)
+			llmEndpoint = strings.Replace(llmEndpoint, "127.0.0.1", "host.docker.internal", 1)
+		}
+
+		cfg.Analyzer = config.AnalyzerConfig{
+			DisableAI: state.DisableAI,
+			LLM: config.LLMConfig{
+				Provider: state.LLMProvider,
+				APIKey:   state.LLMAPIKey,
+				Model:    state.LLMModel,
+				Endpoint: llmEndpoint,
+			},
+		}
+		cfg.Telegram = config.TelegramConfig{
+			BotToken:          state.TelegramBotToken,
+			AuthorizedUserID:  state.TelegramUserID,
+			EscalationTimeout: 5 * time.Minute,
+		}
+	}
+
+	return cfg
+}
+
+// UpdateLocal rebuilds Docker images and restarts containers using existing config.
 func UpdateLocal(logFn func(string)) error {
-	baseDir := filepath.Join(os.TempDir(), "crypto-claw-local")
+	baseDir := localBaseDir()
 
 	// Verify config exists from a previous install.
 	for _, party := range []string{"a", "b"} {
@@ -366,73 +455,70 @@ func UpdateLocal(logFn func(string)) error {
 		}
 	}
 
-	// Kill existing processes.
-	logFn("[update] Stopping existing party processes...")
+	// Stop existing containers.
+	logFn("[update] Stopping existing containers...")
 	killExistingParties(logFn)
 
-	// Start Party B.
-	logFn("[update] Starting Party B...")
-	partyBDir := filepath.Join(baseDir, "party-b")
-	cmdB := exec.Command("go", "run", "./cmd/party-b", "-config", filepath.Join(partyBDir, "config.json"))
-	cmdB.Dir = findProjectRoot()
-	cmdB.Env = append(os.Environ(), "ALLOW_LOCAL_RPC=1")
-	cmdB.Stdout = os.Stdout
-	cmdB.Stderr = os.Stderr
-	if err := cmdB.Start(); err != nil {
-		logFn(fmt.Sprintf("[update] WARNING: Could not start Party B: %v", err))
-		logFn("[update] Start manually: go run ./cmd/party-b -config " + filepath.Join(partyBDir, "config.json"))
-	} else {
-		logFn(fmt.Sprintf("[update] Party B started (PID %d)", cmdB.Process.Pid))
-	}
+	// Rebuild Docker images from source (picks up code changes).
+	projectRoot := findProjectRoot()
+	for _, party := range []string{"a", "b"} {
+		imageName := fmt.Sprintf("crypto-claw-party-%s:latest", party)
+		dockerfile := fmt.Sprintf("docker/Dockerfile.party-%s", party)
+		logFn(fmt.Sprintf("[update] Rebuilding Docker image %s...", imageName))
 
-	// Start Party A.
-	logFn("[update] Starting Party A...")
-	partyADir := filepath.Join(baseDir, "party-a")
-	cmdA := exec.Command("go", "run", "./cmd/party-a", "-config", filepath.Join(partyADir, "config.json"))
-	cmdA.Dir = findProjectRoot()
-	cmdA.Env = append(os.Environ(), "ALLOW_LOCAL_RPC=1")
-	cmdA.Stdout = os.Stdout
-	cmdA.Stderr = os.Stderr
-	if err := cmdA.Start(); err != nil {
-		logFn(fmt.Sprintf("[update] WARNING: Could not start Party A: %v", err))
-		logFn("[update] Start manually: go run ./cmd/party-a -config " + filepath.Join(partyADir, "config.json"))
-	} else {
-		logFn(fmt.Sprintf("[update] Party A started (PID %d)", cmdA.Process.Pid))
-	}
-
-	// Verify processes stay alive.
-	waitExit := func(cmd *exec.Cmd, name string) <-chan error {
-		ch := make(chan error, 1)
-		if cmd == nil || cmd.Process == nil {
-			ch <- fmt.Errorf("%s was not started", name)
-			return ch
+		if err := dockerBuildWithLogs(projectRoot, dockerfile, imageName, logFn); err != nil {
+			return fmt.Errorf("build %s: %w", imageName, err)
 		}
-		go func() { ch <- cmd.Wait() }()
-		return ch
+		logFn(fmt.Sprintf("[update] Image %s rebuilt.", imageName))
 	}
-	exitB := waitExit(cmdB, "Party B")
-	exitA := waitExit(cmdA, "Party A")
 
-	timer := time.NewTimer(5 * time.Second)
-	defer timer.Stop()
-	var procErrors []string
-	for i := 0; i < 2; i++ {
-		select {
-		case err := <-exitB:
-			exitB = nil
-			procErrors = append(procErrors, fmt.Sprintf("Party B exited early: %v", err))
-		case err := <-exitA:
-			exitA = nil
-			procErrors = append(procErrors, fmt.Sprintf("Party A exited early: %v", err))
-		case <-timer.C:
-			i = 2
+	// Start containers.
+	for _, party := range []string{"b", "a"} {
+		partyDir := filepath.Join(baseDir, "party-"+party)
+		containerName := containerNameA
+		port := "8080"
+		if party == "b" {
+			containerName = containerNameB
+			port = "9000"
+		}
+		imageName := fmt.Sprintf("crypto-claw-party-%s:latest", party)
+
+		logFn(fmt.Sprintf("[update] Starting %s...", containerName))
+		cmd := exec.Command("docker", "run", "-d",
+			"--name", containerName,
+			"-v", partyDir+":"+remoteConfigDir+":ro",
+			"-p", port+":"+port,
+			"--add-host=host.docker.internal:host-gateway",
+			"-e", "ALLOW_LOCAL_RPC=1",
+			imageName,
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			logFn(fmt.Sprintf("[update] docker run output: %s", string(out)))
+			return fmt.Errorf("start %s: %w", containerName, err)
+		}
+		containerID := strings.TrimSpace(string(out))
+		if len(containerID) > 12 {
+			containerID = containerID[:12]
+		}
+		logFn(fmt.Sprintf("[update] %s started (container %s)", containerName, containerID))
+	}
+
+	// Verify containers are running.
+	time.Sleep(3 * time.Second)
+	var containerErrors []string
+	for _, name := range []string{containerNameB, containerNameA} {
+		out, err := exec.Command("docker", "inspect", "-f", "{{.State.Running}}", name).Output()
+		if err != nil || strings.TrimSpace(string(out)) != "true" {
+			logs, _, _ := dockerLogs(name, 20)
+			containerErrors = append(containerErrors, fmt.Sprintf("%s not running. Logs:\n%s", name, logs))
 		}
 	}
-	if len(procErrors) > 0 {
-		for _, e := range procErrors {
+	if len(containerErrors) > 0 {
+		for _, e := range containerErrors {
 			logFn(fmt.Sprintf("[update] ERROR: %s", e))
 		}
-		return fmt.Errorf("processes failed to stay running: %s", strings.Join(procErrors, "; "))
+		return fmt.Errorf("containers failed to start: %s", strings.Join(containerErrors, "; "))
 	}
 
 	logFn("[update] Local update complete.")
@@ -498,44 +584,118 @@ func bytesEqual(a, b []byte) bool {
 	return true
 }
 
-// killExistingParties finds and kills any running party-a/party-b processes from a previous deploy.
+// killExistingParties stops and removes any existing Docker containers, and also
+// cleans up any leftover bare processes from older installs.
 func killExistingParties(logFn func(string)) {
-	killed := false
+	stopped := false
+
+	// Stop and remove Docker containers.
+	for _, name := range []string{containerNameA, containerNameB} {
+		out, err := exec.Command("docker", "inspect", "-f", "{{.State.Running}}", name).Output()
+		if err == nil {
+			exec.Command("docker", "stop", name).Run()
+			exec.Command("docker", "rm", name).Run()
+			if strings.TrimSpace(string(out)) == "true" {
+				logFn(fmt.Sprintf("[local] Stopped container %s.", name))
+				stopped = true
+			} else {
+				// Container existed but wasn't running — just remove.
+				logFn(fmt.Sprintf("[local] Removed stopped container %s.", name))
+			}
+		}
+	}
+
+	// Also kill any bare processes from older (pre-Docker) installs.
 	for _, pattern := range []string{"party-a", "party-b"} {
-		// Try both the binary name and the go run pattern.
 		exec.Command("pkill", "-f", pattern).Run()
 	}
-	// Check if ports are now free.
 	for _, port := range []string{"8080", "9000"} {
 		out, _ := exec.Command("lsof", "-ti", ":"+port).Output()
 		pids := strings.TrimSpace(string(out))
 		if pids != "" {
 			for _, pid := range strings.Split(pids, "\n") {
 				exec.Command("kill", pid).Run()
-				killed = true
+				stopped = true
 			}
 		}
 	}
-	if killed {
-		logFn("[local] Killed existing party processes.")
+
+	if stopped {
 		time.Sleep(1 * time.Second) // let ports release
 	}
 }
 
-// ensureLocalPostgres creates the crypto_claw PostgreSQL role and databases if they don't exist.
-func ensureLocalPostgres(logFn func(string)) error {
-	// Check if psql is available.
-	if _, err := exec.LookPath("psql"); err != nil {
-		return fmt.Errorf("psql not found — please install PostgreSQL")
+// dockerLogs fetches the last N lines of logs from a Docker container.
+func dockerLogs(containerName string, lines int) (string, string, error) {
+	cmd := exec.Command("docker", "logs", "--tail", fmt.Sprintf("%d", lines), containerName)
+	out, err := cmd.CombinedOutput()
+	return string(out), "", err
+}
+
+// dockerBuildWithLogs runs docker build and streams output to logFn line by line.
+func dockerBuildWithLogs(projectRoot, dockerfile, imageName string, logFn func(string)) error {
+	cmd := exec.Command("docker", "build", "--progress=plain", "-t", imageName, "-f", dockerfile, ".")
+	cmd.Dir = projectRoot
+
+	// Use io.Pipe to merge stdout and stderr into a single stream.
+	pr, pw := io.Pipe()
+	cmd.Stdout = pw
+	cmd.Stderr = pw
+
+	if err := cmd.Start(); err != nil {
+		pw.Close()
+		return fmt.Errorf("start: %w", err)
 	}
 
-	// Check if PostgreSQL is running.
-	out, err := exec.Command("pg_isready").CombinedOutput()
+	// Read lines in a goroutine so we don't block.
+	scanDone := make(chan struct{})
+	go func() {
+		defer close(scanDone)
+		scanner := bufio.NewScanner(pr)
+		scanner.Buffer(make([]byte, 0, 64*1024), 256*1024)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if trimmed := strings.TrimSpace(line); trimmed != "" {
+				logFn(fmt.Sprintf("[build] %s", trimmed))
+			}
+		}
+	}()
+
+	err := cmd.Wait()
+	pw.Close() // signals EOF to the scanner
+	<-scanDone // wait for scanner to finish
+
 	if err != nil {
-		return fmt.Errorf("PostgreSQL is not running: %s", strings.TrimSpace(string(out)))
+		return fmt.Errorf("docker build failed: %w", err)
+	}
+	return nil
+}
+
+// ensureLocalPostgres ensures PostgreSQL is available for local mode.
+// First checks for a host PostgreSQL; if not found, starts a Docker container.
+func ensureLocalPostgres(logFn func(string)) error {
+	// Try host PostgreSQL first.
+	if hostPGAvailable() {
+		logFn("[local] Using host PostgreSQL.")
+		return ensureHostPostgresDatabases(logFn)
 	}
 
-	// Create role if it doesn't exist.
+	// No host Postgres — use Docker.
+	logFn("[local] No host PostgreSQL found, starting Docker PostgreSQL...")
+	return ensureDockerPostgres(logFn)
+}
+
+// hostPGAvailable checks if a host PostgreSQL is running and accessible.
+func hostPGAvailable() bool {
+	if _, err := exec.LookPath("pg_isready"); err != nil {
+		return false
+	}
+	err := exec.Command("pg_isready", "-q").Run()
+	return err == nil
+}
+
+// ensureHostPostgresDatabases creates role and databases on the host PostgreSQL.
+func ensureHostPostgresDatabases(logFn func(string)) error {
 	roleCheck, _ := exec.Command("psql", "-tAc",
 		"SELECT 1 FROM pg_roles WHERE rolname='crypto_claw'", "postgres").Output()
 	if strings.TrimSpace(string(roleCheck)) != "1" {
@@ -549,7 +709,6 @@ func ensureLocalPostgres(logFn func(string)) error {
 		logFn("[local] PostgreSQL role 'crypto_claw' already exists.")
 	}
 
-	// Create databases if they don't exist.
 	for _, dbName := range []string{"crypto_claw_a", "crypto_claw_b"} {
 		dbCheck, _ := exec.Command("psql", "-tAc",
 			fmt.Sprintf("SELECT 1 FROM pg_database WHERE datname='%s'", dbName), "postgres").Output()
@@ -564,6 +723,73 @@ func ensureLocalPostgres(logFn func(string)) error {
 		}
 	}
 
+	logFn("[local] PostgreSQL setup complete.")
+	return nil
+}
+
+// ensureDockerPostgres starts a PostgreSQL Docker container and creates the required
+// role and databases. If the container already exists and is running, it's reused.
+func ensureDockerPostgres(logFn func(string)) error {
+	// Check if our PG container already exists and is running.
+	out, err := exec.Command("docker", "inspect", "-f", "{{.State.Running}}", containerNamePG).Output()
+	if err == nil && strings.TrimSpace(string(out)) == "true" {
+		logFn("[local] PostgreSQL container already running.")
+		return ensureDockerPostgresDatabases(logFn)
+	}
+
+	// Remove stopped container if it exists.
+	exec.Command("docker", "rm", containerNamePG).Run()
+
+	// Start PostgreSQL container.
+	logFn("[local] Starting PostgreSQL container...")
+	cmd := exec.Command("docker", "run", "-d",
+		"--name", containerNamePG,
+		"-p", "5432:5432",
+		"-e", "POSTGRES_USER=crypto_claw",
+		"-e", "POSTGRES_PASSWORD=crypto_claw",
+		"-e", "POSTGRES_DB=crypto_claw_a",
+		"--restart", "unless-stopped",
+		"postgres:16-alpine",
+	)
+	runOut, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("start postgres container: %s: %w", strings.TrimSpace(string(runOut)), err)
+	}
+	logFn("[local] PostgreSQL container started.")
+
+	// Wait for it to be ready (up to 30s).
+	logFn("[local] Waiting for PostgreSQL to be ready...")
+	for i := 0; i < 30; i++ {
+		check := exec.Command("docker", "exec", containerNamePG,
+			"pg_isready", "-U", "crypto_claw")
+		if check.Run() == nil {
+			logFn("[local] PostgreSQL is ready.")
+			return ensureDockerPostgresDatabases(logFn)
+		}
+		time.Sleep(1 * time.Second)
+	}
+	return fmt.Errorf("PostgreSQL container failed to become ready within 30s")
+}
+
+// ensureDockerPostgresDatabases creates the second database (crypto_claw_b) inside
+// the Docker PostgreSQL container. crypto_claw_a is created by POSTGRES_DB env var.
+func ensureDockerPostgresDatabases(logFn func(string)) error {
+	// crypto_claw_a already exists (created by POSTGRES_DB).
+	// Create crypto_claw_b if it doesn't exist.
+	check := exec.Command("docker", "exec", containerNamePG,
+		"psql", "-U", "crypto_claw", "-tAc",
+		"SELECT 1 FROM pg_database WHERE datname='crypto_claw_b'")
+	out, _ := check.Output()
+	if strings.TrimSpace(string(out)) != "1" {
+		logFn("[local] Creating database 'crypto_claw_b'...")
+		cmd := exec.Command("docker", "exec", containerNamePG,
+			"createdb", "-U", "crypto_claw", "crypto_claw_b")
+		if createOut, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("create crypto_claw_b: %s: %w", strings.TrimSpace(string(createOut)), err)
+		}
+	} else {
+		logFn("[local] Database 'crypto_claw_b' already exists.")
+	}
 	logFn("[local] PostgreSQL setup complete.")
 	return nil
 }

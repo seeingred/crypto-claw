@@ -84,6 +84,13 @@ export async function saveLLMConfig(config) {
   });
 }
 
+export async function testLLMConnection(config) {
+  return request('/llm/test', {
+    method: 'POST',
+    body: JSON.stringify(config),
+  });
+}
+
 export async function skipLLM() {
   return request('/llm/skip', {
     method: 'POST',
@@ -162,6 +169,12 @@ export async function fetchTokenAccounts(address, rpcUrl) {
 
 export async function getState() {
   return request('/state', {
+    method: 'GET',
+  });
+}
+
+export async function preflight() {
+  return request('/preflight', {
     method: 'GET',
   });
 }

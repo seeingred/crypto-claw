@@ -5,6 +5,7 @@
   import Card from '../components/Card.svelte';
   import { currentStep, wizardState, deployLogs } from '../stores.js';
   import { installPrepare, startDeployment, subscribeDeployLogs, verifyTelegram } from '../api.js';
+  import { createProgressEstimator } from '../progress.js';
 
   // Phases: generating → mnemonic → telegram → deploying → done → error
   // In restore mode: skip generating/mnemonic, go straight to telegram.
@@ -88,9 +89,8 @@
     telegramVerifying = false;
   }
 
-  // Estimate progress from log messages.
-  let logCount = 0;
-  const EXPECTED_LOG_COUNT = 12;
+  // Estimate progress from log messages using asymptotic approach.
+  let estimateProgress = createProgressEstimator();
 
   function addLog(message) {
     deployLogs.update((l) => [
@@ -108,7 +108,7 @@
     phase = 'deploying';
     deployLogs.set([]);
     progress = 0;
-    logCount = 0;
+    estimateProgress = createProgressEstimator();
 
     unsubscribeLogs = subscribeDeployLogs((data) => {
       if (data.type === 'complete') {
@@ -125,9 +125,9 @@
         return;
       }
 
-      logCount++;
-      progress = Math.min(95, Math.round((logCount / EXPECTED_LOG_COUNT) * 100));
-      addLog(data.message || JSON.stringify(data));
+      const message = data.message || JSON.stringify(data);
+      progress = estimateProgress(message);
+      addLog(message);
     });
 
     try {

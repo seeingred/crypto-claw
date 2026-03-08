@@ -65,6 +65,11 @@
       title: 'Copy the token',
       desc: 'BotFather will give you an API token. Paste it below.',
     },
+    {
+      num: 4,
+      title: 'Save the token',
+      desc: 'Keep your bot token safe — you will need it if you ever reinstall or restore the parties.',
+    },
   ];
 </script>
 

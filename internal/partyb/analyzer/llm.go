@@ -130,6 +130,12 @@ func (c *LLMClient) callLLM(ctx context.Context, prompt string) (*llmClassificat
 		if endpoint == "" {
 			return nil, fmt.Errorf("local LLM endpoint not configured")
 		}
+		// If the endpoint is a bare host (no path or just /), append the
+		// OpenAI-compatible chat completions path. Ollama, vLLM, etc.
+		// all support this at /v1/chat/completions.
+		if !strings.Contains(endpoint, "/v1/") && !strings.Contains(endpoint, "/api/") {
+			endpoint = strings.TrimRight(endpoint, "/") + "/v1/chat/completions"
+		}
 		reqBody, err = json.Marshal(openAIRequest{
 			Model: c.cfg.Model,
 			Messages: []openAIMessage{

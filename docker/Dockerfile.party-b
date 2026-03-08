@@ -13,6 +13,6 @@ FROM alpine:3.21
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /party-b /usr/local/bin/party-b
 
-EXPOSE 9443
+EXPOSE 9000
 ENTRYPOINT ["party-b"]
 CMD ["-config", "/etc/crypto-claw/config.json", "-passphrase", ""]
