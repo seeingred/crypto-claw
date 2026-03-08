@@ -240,7 +240,7 @@ Base URL: http://localhost:8080
 
 1. Check connectivity: GET /health
 2. Derive a wallet: POST /derive with a BIP-44 path
-3. Fund the wallet address on-chain
+3. Fund the wallet (wallet funding is the caller's responsibility)
 4. Sign a transaction: POST /sign
 5. If status is "pending_review", poll GET /sign/{txId} until resolved
 6. Broadcast the signed transaction to the chain RPC

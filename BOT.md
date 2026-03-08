@@ -102,7 +102,7 @@ curl -s http://127.0.0.1:8080/derive \
 POST /sign
 ```
 
-Constructs an unsigned transaction, sends it to Party B for validation, and if approved, runs the TSS signing protocol. Returns the signed transaction bytes (base64-encoded).
+Constructs an unsigned transaction, sends it to Party B for validation, and if approved, runs the TSS signing protocol. Returns the signed transaction as `0x`-prefixed hex.
 
 **Request:**
 
@@ -128,13 +128,14 @@ Constructs an unsigned transaction, sends it to Party B for validation, and if a
 | `gasLimit` | number | no | Gas limit (EVM) |
 | `gasPrice` | string | no | Gas price in wei (EVM) |
 | `nonce` | number | no | Transaction nonce (EVM) |
+| `rpcUrl` | string | no | Solana RPC URL — fresh blockhash is fetched right before signing to avoid expiry during approval. SSRF-protected (private IPs blocked in production) |
 
 **Response — signed** `200 OK`:
 
 ```json
 {
   "status": "signed",
-  "signedTx": "base64EncodedSignedTransaction..."
+  "signedTx": "0x..."
 }
 ```
 
@@ -190,6 +191,29 @@ curl -s http://127.0.0.1:8080/sign -d '{
 }' | jq
 ```
 
+**Example — send SOL:**
+
+```bash
+curl -s http://127.0.0.1:8080/sign -d '{
+  "derivationPath": "m/44'\''/501'\''/0'\''/0'\''",
+  "to": ["RecipientBase58Address"],
+  "value": "1000000000",
+  "rpcUrl": "https://api.mainnet-beta.solana.com"
+}' | jq
+```
+
+**Example — send ATOM (Cosmos):**
+
+```bash
+curl -s http://127.0.0.1:8080/sign -d '{
+  "derivationPath": "m/44'\''/118'\''/0'\''/0/0",
+  "to": ["cosmos1..."],
+  "value": "1000000",
+  "chainId": "cosmoshub-4",
+  "data": "uatom"
+}' | jq
+```
+
 ### Poll escalated transaction status
 
 ```
@@ -221,7 +245,7 @@ Once you retrieve a `signed` transaction, it is **deleted from memory**. Subsequ
 {
   "txId": "a1b2c3d4-...",
   "status": "signed",
-  "signedTx": "base64EncodedSignedTransaction..."
+  "signedTx": "0x..."
 }
 ```
 
