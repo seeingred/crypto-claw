@@ -14,6 +14,7 @@ import (
 	txtypes "github.com/cosmos/cosmos-sdk/types/tx"
 	signingtypes "github.com/cosmos/cosmos-sdk/types/tx/signing"
 	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
+	stakingtypes "github.com/cosmos/cosmos-sdk/x/staking/types"
 	"github.com/cosmos/gogoproto/proto"
 
 	"github.com/seeingred/crypto-claw/internal/tss"
@@ -90,19 +91,50 @@ func (a *Adapter) BuildUnsignedTx(_ context.Context, req *vm.TxRequest) (*vm.Uns
 		denom = req.Denom
 	}
 
-	// Build MsgSend.
 	amount, err := strconv.ParseInt(req.Value, 10, 64)
 	if err != nil {
 		return nil, fmt.Errorf("tendermint: invalid value %q: %w", req.Value, err)
 	}
-	msg := &banktypes.MsgSend{
-		FromAddress: req.From,
-		ToAddress:   req.To[0],
-		Amount:      sdk.NewCoins(sdk.NewInt64Coin(denom, amount)),
-	}
+	coin := sdk.NewInt64Coin(denom, amount)
 
-	// Pack into Any.
-	msgAny, err := codectypes.NewAnyWithValue(msg)
+	// Build message based on method.
+	var msgAny *codectypes.Any
+	method := req.Method
+	if method == "" {
+		method = "send"
+	}
+	switch method {
+	case "send":
+		msgAny, err = codectypes.NewAnyWithValue(&banktypes.MsgSend{
+			FromAddress: req.From,
+			ToAddress:   req.To[0],
+			Amount:      sdk.NewCoins(coin),
+		})
+	case "delegate":
+		msgAny, err = codectypes.NewAnyWithValue(&stakingtypes.MsgDelegate{
+			DelegatorAddress: req.From,
+			ValidatorAddress: req.To[0],
+			Amount:           coin,
+		})
+	case "undelegate":
+		msgAny, err = codectypes.NewAnyWithValue(&stakingtypes.MsgUndelegate{
+			DelegatorAddress: req.From,
+			ValidatorAddress: req.To[0],
+			Amount:           coin,
+		})
+	case "redelegate":
+		if len(req.To) < 2 {
+			return nil, fmt.Errorf("tendermint: redelegate requires two addresses in to (src_validator, dst_validator)")
+		}
+		msgAny, err = codectypes.NewAnyWithValue(&stakingtypes.MsgBeginRedelegate{
+			DelegatorAddress:    req.From,
+			ValidatorSrcAddress: req.To[0],
+			ValidatorDstAddress: req.To[1],
+			Amount:              coin,
+		})
+	default:
+		return nil, fmt.Errorf("tendermint: unknown method %q (supported: send, delegate, undelegate, redelegate)", method)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("tendermint: pack msg: %w", err)
 	}
