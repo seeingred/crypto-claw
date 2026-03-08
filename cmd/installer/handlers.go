@@ -214,14 +214,24 @@ func handleInstallRestore(state *WizardState) http.HandlerFunc {
 	}
 }
 
+// exportKeyReq describes a single key to export, with optional bech32 prefix for Cosmos app chains.
+type exportKeyReq struct {
+	Path   string `json:"path"`             // e.g. "m/44'/118'/0'/0/0"
+	Prefix string `json:"prefix,omitempty"` // bech32 prefix, e.g. "osmo", "cosmos", "juno"
+}
+
 // handleInstallExport accepts a mnemonic and optional derivation paths.
 // It derives the exact private keys that TSS would have produced, allowing
-// disaster recovery: mnemonic + paths → private keys → import into MetaMask → move funds.
+// disaster recovery: mnemonic + paths → private keys → import into wallet → move funds.
+// Supports two input formats:
+//   - "paths": ["m/44'/60'/0'/0/0"] — simple string array (EVM/Solana auto-detected)
+//   - "keys": [{"path":"m/44'/118'/0'/0/0","prefix":"osmo"}] — with bech32 prefix for Cosmos app chains
 func handleInstallExport(state *WizardState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			Mnemonic string   `json:"mnemonic"`
-			Paths    []string `json:"paths"` // e.g. ["m/44'/60'/0'/0/0", "m/44'/60'/0'/0/1"]
+			Mnemonic string        `json:"mnemonic"`
+			Paths    []string      `json:"paths"`    // simple: ["m/44'/60'/0'/0/0"]
+			Keys     []exportKeyReq `json:"keys"`     // rich: [{"path":"m/44'/118'/0'/0/0","prefix":"osmo"}]
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
@@ -251,11 +261,20 @@ func handleInstallExport(state *WizardState) http.HandlerFunc {
 		// List derived paths from DB (returned to frontend for user to choose).
 		dbAddrs := listDerivedAddressesFromDB()
 
+		// Merge both input formats into a unified list.
+		exportReqs := make([]exportKeyReq, 0, len(req.Paths)+len(req.Keys))
+		for _, p := range req.Paths {
+			exportReqs = append(exportReqs, exportKeyReq{Path: p})
+		}
+		exportReqs = append(exportReqs, req.Keys...)
+
 		// Derive each requested path using TSS-compatible derivation.
 		var derivedKeys []map[string]string
-		for _, path := range req.Paths {
-			// Detect curve from coin type in path.
+		for _, kr := range exportReqs {
+			path := kr.Path
+			prefix := kr.Prefix
 			coinType := extractCoinTypeFromPath(path)
+
 			if coinType == "501" {
 				// Solana / ed25519 — use SLIP-0010 derivation.
 				exported, err := ExportSolanaKeyAtPath(req.Mnemonic, path)
@@ -274,8 +293,44 @@ func handleInstallExport(state *WizardState) http.HandlerFunc {
 					"privKeyHex": exported.PrivKeyHex,
 					"address":    exported.Address,
 				})
+			} else if prefix != "" {
+				// Cosmos app chain — secp256k1 with bech32 prefix.
+				exported, err := DeriveECDSAKeyTSS(req.Mnemonic, path, prefix)
+				if err != nil {
+					slog.Warn("export: failed to derive Cosmos path", "path", path, "prefix", prefix, "error", err)
+					derivedKeys = append(derivedKeys, map[string]string{
+						"path":  path,
+						"curve": "secp256k1",
+						"error": err.Error(),
+					})
+					continue
+				}
+				derivedKeys = append(derivedKeys, map[string]string{
+					"path":       exported.Path,
+					"curve":      "secp256k1",
+					"privKeyHex": exported.PrivKeyHex,
+					"address":    exported.Address,
+				})
+			} else if coinType == "118" {
+				// Cosmos Hub (no prefix specified) — default to "cosmos".
+				exported, err := DeriveECDSAKeyTSS(req.Mnemonic, path, "cosmos")
+				if err != nil {
+					slog.Warn("export: failed to derive Cosmos path", "path", path, "error", err)
+					derivedKeys = append(derivedKeys, map[string]string{
+						"path":  path,
+						"curve": "secp256k1",
+						"error": err.Error(),
+					})
+					continue
+				}
+				derivedKeys = append(derivedKeys, map[string]string{
+					"path":       exported.Path,
+					"curve":      "secp256k1",
+					"privKeyHex": exported.PrivKeyHex,
+					"address":    exported.Address,
+				})
 			} else {
-				// EVM / secp256k1 — use TSS-compatible derivation.
+				// EVM / secp256k1.
 				exported, err := DeriveECDSAKeyTSS(req.Mnemonic, path)
 				if err != nil {
 					slog.Warn("export: failed to derive path", "path", path, "error", err)

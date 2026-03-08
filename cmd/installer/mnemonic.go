@@ -12,6 +12,8 @@ import (
 	"math/big"
 
 	"github.com/bnb-chain/tss-lib/v2/tss"
+	cosmosecp "github.com/cosmos/cosmos-sdk/crypto/keys/secp256k1"
+	"github.com/cosmos/cosmos-sdk/types/bech32"
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
 	"github.com/mr-tron/base58"
 	"github.com/tyler-smith/go-bip39"
@@ -192,7 +194,8 @@ type DerivedKeyExport struct {
 // TSS uses non-hardened (compressed pubkey) derivation at ALL levels, even for indices
 // with the hardened bit set. This produces the exact same keys as the TSS /derive endpoint.
 // Use this to recover funds from TSS-derived addresses when you only have the mnemonic.
-func DeriveECDSAKeyTSS(mnemonic string, path string) (*DerivedKeyExport, error) {
+// Optional bech32Prefix: if set, derives a Cosmos bech32 address instead of EVM.
+func DeriveECDSAKeyTSS(mnemonic string, path string, bech32Prefix ...string) (*DerivedKeyExport, error) {
 	if !bip39.IsMnemonicValid(mnemonic) {
 		return nil, fmt.Errorf("invalid mnemonic")
 	}
@@ -250,11 +253,23 @@ func DeriveECDSAKeyTSS(mnemonic string, path string) (*DerivedKeyExport, error) 
 
 	// Compute address
 	x, y := curve.ScalarBaseMult(key.Bytes())
-	addr := ethcrypto.PubkeyToAddress(ecdsa.PublicKey{
-		Curve: curve,
-		X:     x,
-		Y:     y,
-	}).Hex()
+	var addr string
+	if len(bech32Prefix) > 0 && bech32Prefix[0] != "" {
+		// Cosmos bech32 address: compress → secp256k1.PubKey → Address → bech32
+		compressed := compressPubKey(x, y)
+		pk := &cosmosecp.PubKey{Key: compressed}
+		bech, err := bech32.ConvertAndEncode(bech32Prefix[0], pk.Address())
+		if err != nil {
+			return nil, fmt.Errorf("bech32 encode: %w", err)
+		}
+		addr = bech
+	} else {
+		addr = ethcrypto.PubkeyToAddress(ecdsa.PublicKey{
+			Curve: curve,
+			X:     x,
+			Y:     y,
+		}).Hex()
+	}
 
 	// Pad private key to 32 bytes
 	privBytes := key.Bytes()

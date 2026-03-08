@@ -11,6 +11,7 @@
   let exportPaths = $state('');
   let exportResult = $state(null);
   let derivingPath = $state('');
+  let derivingPrefix = $state('');
   let errorMsg = $state('');
   let logs = $state([]);
   let progress = $state(0);
@@ -72,17 +73,23 @@
       return;
     }
     errorMsg = '';
+    const prefix = derivingPrefix.trim();
     try {
-      const result = await installExport(exportMnemonic.trim(), [path]);
+      let result;
+      if (prefix) {
+        result = await installExport(exportMnemonic.trim(), [], [{ path, prefix }]);
+      } else {
+        result = await installExport(exportMnemonic.trim(), [path]);
+      }
       if (result.derivedKeys?.length > 0) {
         const newKey = result.derivedKeys[0];
         if (newKey.error) {
           errorMsg = `Failed to derive ${path}: ${newKey.error}`;
           return;
         }
-        // Add to existing results, avoid duplicates
+        // Add to existing results, avoid duplicates by path+address
         const existing = exportResult.derivedKeys || [];
-        const alreadyExists = existing.some(k => k.path === newKey.path);
+        const alreadyExists = existing.some(k => k.path === newKey.path && k.address === newKey.address);
         if (!alreadyExists) {
           exportResult = {
             ...exportResult,
@@ -91,22 +98,49 @@
         }
       }
       derivingPath = '';
+      derivingPrefix = '';
     } catch (err) {
       errorMsg = err.message || 'Failed to derive path';
     }
   }
 
+  // Infer bech32 prefix from a Cosmos address like "cosmos1abc..." or "osmo1xyz..."
+  function inferBech32Prefix(address) {
+    if (!address || address.startsWith('0x')) return '';
+    const idx = address.indexOf('1');
+    if (idx > 0 && idx < 10) return address.substring(0, idx);
+    return '';
+  }
+
+  // Detect key type for display: 'sol', 'evm', or 'cosmos'
+  function keyType(key) {
+    if (key.curve === 'ed25519') return 'sol';
+    if (key.address && !key.address.startsWith('0x')) return 'cosmos';
+    return 'evm';
+  }
+
   async function deriveAllDBPaths() {
     if (!exportResult?.dbAddresses?.length) return;
-    const allPaths = exportResult.dbAddresses.map(a => a.path);
-    if (allPaths.length === 0) return;
     errorMsg = '';
+
+    // Split into simple paths (EVM/SOL) and keyed paths (Cosmos with prefix)
+    const simplePaths = [];
+    const keyedPaths = [];
+    for (const a of exportResult.dbAddresses) {
+      const prefix = inferBech32Prefix(a.address);
+      if (prefix) {
+        keyedPaths.push({ path: a.path, prefix });
+      } else {
+        simplePaths.push(a.path);
+      }
+    }
+
     try {
-      const result = await installExport(exportMnemonic.trim(), allPaths);
+      const result = await installExport(exportMnemonic.trim(), simplePaths, keyedPaths);
       if (result.derivedKeys?.length > 0) {
         const existing = exportResult.derivedKeys || [];
-        const existingPaths = new Set(existing.map(k => k.path));
-        const newKeys = result.derivedKeys.filter(k => !existingPaths.has(k.path));
+        const existingSet = new Set(existing.map(k => `${k.path}:${k.address}`));
+        const newKeys = result.derivedKeys.filter(k => !existingSet.has(`${k.path}:${k.address}`));
         exportResult = {
           ...exportResult,
           derivedKeys: [...existing, ...newKeys],
@@ -601,7 +635,8 @@
         <p class="text-sm text-gray-600 dark:text-gray-400 mb-4">
           Enter a derivation path to get the private key for that address. Use the same paths the bot derived.
           EVM: <code class="text-xs bg-gray-100 dark:bg-gray-800 px-1 rounded">m/44'/60'/0'/0/0</code>,
-          Solana: <code class="text-xs bg-gray-100 dark:bg-gray-800 px-1 rounded">m/44'/501'/0'/0/0</code>
+          Solana: <code class="text-xs bg-gray-100 dark:bg-gray-800 px-1 rounded">m/44'/501'/0'/0/0</code>,
+          Cosmos: <code class="text-xs bg-gray-100 dark:bg-gray-800 px-1 rounded">m/44'/118'/0'/0/0</code> + prefix
         </p>
 
         <!-- Derive input -->
@@ -611,6 +646,11 @@
             placeholder="m/44'/60'/0'/0/0"
             class="flex-1 px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 text-gray-900 dark:text-white font-mono text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none"
             onkeydown={(e) => { if (e.key === 'Enter') derivePath(); }}
+          />
+          <input
+            bind:value={derivingPrefix}
+            placeholder="prefix (e.g. osmo)"
+            class="w-36 px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 text-gray-900 dark:text-white font-mono text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none"
           />
           <Button onclick={derivePath}>Derive</Button>
         </div>
@@ -675,8 +715,8 @@
               <div class="p-3 rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900/50">
                 <div class="flex items-center justify-between mb-2">
                   <div class="flex items-center gap-2">
-                    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium {key.curve === 'ed25519' ? 'bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300' : 'bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300'}">
-                      {key.curve === 'ed25519' ? 'SOL' : 'EVM'}
+                    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium {keyType(key) === 'sol' ? 'bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300' : keyType(key) === 'cosmos' ? 'bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-300' : 'bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300'}">
+                      {keyType(key) === 'sol' ? 'SOL' : keyType(key) === 'cosmos' ? 'COSMOS' : 'EVM'}
                     </span>
                     <code class="text-xs font-semibold text-gray-700 dark:text-gray-300">{key.path}</code>
                   </div>
@@ -766,9 +806,11 @@
                         </div>
                       </div>
                     {:else}
-                      <!-- EVM: Standard private key export -->
+                      <!-- secp256k1: Private key export (EVM or Cosmos) -->
                       <div>
-                        <label class="block text-xs text-gray-500 dark:text-gray-400 mb-0.5">Private Key (import into MetaMask)</label>
+                        <label class="block text-xs text-gray-500 dark:text-gray-400 mb-0.5">
+                          Private Key ({keyType(key) === 'cosmos' ? 'import into Keplr/Leap' : 'import into MetaMask'})
+                        </label>
                         <div class="flex items-center gap-2">
                           <code class="flex-1 text-xs bg-red-50 dark:bg-red-900/20 text-red-800 dark:text-red-300 px-2 py-1 rounded font-mono break-all">{key.privKeyHex}</code>
                           <button onclick={() => copyToClipboard(key.privKeyHex)} class="shrink-0 px-2 py-1 text-xs rounded bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 transition-colors cursor-pointer">Copy</button>
