@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,6 +29,44 @@ const (
 	dockerImage     = "ghcr.io/seeingred/crypto-claw"
 )
 
+// remoteOS detects the operating system on a remote SSH host.
+// Returns "darwin" for macOS, "linux" for Linux.
+func remoteOS(client *ssh.Client) string {
+	out, _, _ := SSHRunCommand(client, "uname -s")
+	if strings.TrimSpace(strings.ToLower(out)) == "darwin" {
+		return "darwin"
+	}
+	return "linux"
+}
+
+// remoteConfigPath returns the config directory for the given OS.
+// macOS: ~/.crypto-claw (no sudo needed), Linux: /etc/crypto-claw.
+func remoteConfigPath(osType string, client *ssh.Client) string {
+	if osType == "darwin" {
+		home, _, _ := SSHRunCommand(client, "echo $HOME")
+		return filepath.Join(strings.TrimSpace(home), ".crypto-claw")
+	}
+	return remoteConfigDir
+}
+
+// sudoPrefix returns "sudo " on Linux and "" on macOS (Docker Desktop runs as user).
+func sudoPrefix(osType string) string {
+	if osType == "darwin" {
+		return ""
+	}
+	return "sudo "
+}
+
+// sshRunWithPath runs a command via SSH with an extended PATH on macOS.
+// On macOS, SSH sessions get a minimal PATH that doesn't include /usr/local/bin
+// or /opt/homebrew/bin where Docker and Homebrew tools live.
+func sshRunWithPath(client *ssh.Client, osType string, cmd string) (string, string, error) {
+	if osType == "darwin" {
+		cmd = `export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"; ` + cmd
+	}
+	return SSHRunCommand(client, cmd)
+}
+
 // DeployParty deploys a single party to a remote server via SSH.
 // The party parameter should be "a" or "b".
 func DeployParty(client *ssh.Client, party string, cfg *config.Config, cert, key, caCert []byte, logFn func(string)) error {
@@ -36,24 +75,40 @@ func DeployParty(client *ssh.Client, party string, cfg *config.Config, cert, key
 		containerName = containerNameB
 	}
 
+	// Detect remote OS.
+	osType := remoteOS(client)
+	sudo := sudoPrefix(osType)
+	cfgDir := remoteConfigPath(osType, client)
+	logFn(fmt.Sprintf("[%s] Detected remote OS: %s", party, osType))
+
 	// Step 1: Install Docker if not present.
 	logFn(fmt.Sprintf("[%s] Checking for Docker installation...", party))
-	if err := ensureDocker(client, logFn, party); err != nil {
+	if err := ensureDocker(client, logFn, party, osType); err != nil {
 		return fmt.Errorf("ensure docker: %w", err)
 	}
 
+	// Step 1.5: Ensure PostgreSQL is running on the remote server.
+	logFn(fmt.Sprintf("[%s] Setting up PostgreSQL...", party))
+	if err := ensureRemotePostgres(client, party, sudo, osType, logFn); err != nil {
+		return fmt.Errorf("ensure postgres: %w", err)
+	}
+
 	// Step 2: Create config directory.
-	logFn(fmt.Sprintf("[%s] Creating config directory %s...", party, remoteConfigDir))
-	if _, _, err := SSHRunCommand(client, fmt.Sprintf("sudo mkdir -p %s && sudo chmod 700 %s", remoteConfigDir, remoteConfigDir)); err != nil {
+	logFn(fmt.Sprintf("[%s] Creating config directory %s...", party, cfgDir))
+	mkdirCmd := fmt.Sprintf("%smkdir -p %s && %schmod 700 %s", sudo, cfgDir, sudo, cfgDir)
+	if osType == "darwin" {
+		mkdirCmd = fmt.Sprintf("mkdir -p %s && chmod 700 %s", cfgDir, cfgDir)
+	}
+	if _, _, err := SSHRunCommand(client, mkdirCmd); err != nil {
 		return fmt.Errorf("create config dir: %w", err)
 	}
 
 	// Step 3: Upload TLS certificates.
 	logFn(fmt.Sprintf("[%s] Uploading TLS certificates...", party))
 	certFiles := map[string][]byte{
-		filepath.Join(remoteConfigDir, "cert.pem"): cert,
-		filepath.Join(remoteConfigDir, "key.pem"):  key,
-		filepath.Join(remoteConfigDir, "ca.pem"):   caCert,
+		filepath.Join(cfgDir, "cert.pem"): cert,
+		filepath.Join(cfgDir, "key.pem"):  key,
+		filepath.Join(cfgDir, "ca.pem"):   caCert,
 	}
 	for path, data := range certFiles {
 		if err := SSHUploadFile(client, data, path); err != nil {
@@ -61,25 +116,34 @@ func DeployParty(client *ssh.Client, party string, cfg *config.Config, cert, key
 		}
 	}
 
-	// Step 4: Write config.json.
+	// Step 4: Write config.json — update paths to match remote config dir.
 	logFn(fmt.Sprintf("[%s] Writing configuration...", party))
+	cfg.DataDir = cfgDir
+	cfg.Transport.CertFile = filepath.Join(cfgDir, "cert.pem")
+	cfg.Transport.KeyFile = filepath.Join(cfgDir, "key.pem")
+	cfg.Transport.CACertFile = filepath.Join(cfgDir, "ca.pem")
+	// macOS Docker: container can't reach host at 127.0.0.1, use host.docker.internal.
+	// Linux: --network host means 127.0.0.1 works fine.
+	if osType == "darwin" && cfg.Database.Host == "127.0.0.1" {
+		cfg.Database.Host = "host.docker.internal"
+	}
 	cfgJSON, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
-	configPath := filepath.Join(remoteConfigDir, "config.json")
+	configPath := filepath.Join(cfgDir, "config.json")
 	if err := SSHUploadFile(client, cfgJSON, configPath); err != nil {
 		return fmt.Errorf("upload config: %w", err)
 	}
 
-	// Step 5: Pull Docker image.
+	// Step 5: Pull Docker image, fall back to building from source.
 	logFn(fmt.Sprintf("[%s] Pulling Docker image...", party))
 	imageTag := fmt.Sprintf("%s:party-%s-latest", dockerImage, party)
-	stdout, stderr, err := SSHRunCommand(client, fmt.Sprintf("sudo docker pull %s 2>&1 || true", imageTag))
-	if err != nil {
+	stdout, stderr, err := sshRunWithPath(client, osType, fmt.Sprintf("%sdocker pull %s 2>&1", sudo, imageTag))
+	if err != nil || strings.Contains(stdout, "denied") || strings.Contains(stdout, "not found") {
 		slog.Warn("docker pull failed, will attempt build", "party", party, "stdout", stdout, "stderr", stderr)
-		logFn(fmt.Sprintf("[%s] Docker pull failed, attempting build from source...", party))
-		if buildErr := buildFromSource(client, party, logFn); buildErr != nil {
+		logFn(fmt.Sprintf("[%s] Docker pull failed, building from source...", party))
+		if buildErr := buildFromSource(client, party, logFn, osType); buildErr != nil {
 			return fmt.Errorf("build from source: %w", buildErr)
 		}
 		imageTag = fmt.Sprintf("crypto-claw-party-%s:latest", party)
@@ -87,28 +151,52 @@ func DeployParty(client *ssh.Client, party string, cfg *config.Config, cert, key
 
 	// Step 6: Stop and remove existing container if present.
 	logFn(fmt.Sprintf("[%s] Stopping any existing container...", party))
-	SSHRunCommand(client, fmt.Sprintf("sudo docker stop %s 2>/dev/null; sudo docker rm %s 2>/dev/null", containerName, containerName))
+	sshRunWithPath(client, osType, fmt.Sprintf("%sdocker stop %s 2>/dev/null; %sdocker rm %s 2>/dev/null", sudo, containerName, sudo, containerName))
 
 	// Step 7: Create and start Docker container.
 	logFn(fmt.Sprintf("[%s] Starting Docker container...", party))
-	listenPort := "9000"
-	if party == "a" {
-		listenPort = "8080"
+	listenPort := "8080"
+	if party == "b" {
+		// Extract port from transport listen addr (e.g. "0.0.0.0:443" -> "443").
+		if _, p, err := net.SplitHostPort(cfg.Transport.ListenAddr); err == nil {
+			listenPort = p
+		} else {
+			listenPort = "443"
+		}
 	}
 
-	runCmd := fmt.Sprintf(
-		"sudo docker run -d --name %s --restart unless-stopped "+
-			"-v %s:%s:ro "+
-			"-p %s:%s "+
-			"%s "+
-			"-config %s/config.json",
-		containerName,
-		remoteConfigDir, remoteConfigDir,
-		listenPort, listenPort,
-		imageTag,
-		remoteConfigDir,
-	)
-	stdout, stderr, err = SSHRunCommand(client, runCmd)
+	var runCmd string
+	if osType == "linux" {
+		// Linux: use --network host so container can reach host Postgres at 127.0.0.1.
+		runCmd = fmt.Sprintf(
+			"%sdocker run -d --name %s --restart unless-stopped "+
+				"--network host "+
+				"-v %s:%s:ro "+
+				"%s "+
+				"-config %s/config.json",
+			sudo,
+			containerName,
+			cfgDir, cfgDir,
+			imageTag,
+			cfgDir,
+		)
+	} else {
+		// macOS: use host.docker.internal to reach host Postgres.
+		runCmd = fmt.Sprintf(
+			"docker run -d --name %s --restart unless-stopped "+
+				"-v %s:%s:ro "+
+				"-p %s:%s "+
+				"--add-host=host.docker.internal:host-gateway "+
+				"%s "+
+				"-config %s/config.json",
+			containerName,
+			cfgDir, cfgDir,
+			listenPort, listenPort,
+			imageTag,
+			cfgDir,
+		)
+	}
+	stdout, stderr, err = sshRunWithPath(client, osType, runCmd)
 	if err != nil {
 		return fmt.Errorf("start container: %s %s: %w", stdout, stderr, err)
 	}
@@ -121,10 +209,10 @@ func DeployParty(client *ssh.Client, party string, cfg *config.Config, cert, key
 	// Step 8: Verify container is running.
 	logFn(fmt.Sprintf("[%s] Verifying container health...", party))
 	time.Sleep(2 * time.Second)
-	stdout, _, err = SSHRunCommand(client, fmt.Sprintf("sudo docker inspect -f '{{.State.Running}}' %s", containerName))
+	stdout, _, err = sshRunWithPath(client, osType, fmt.Sprintf("%sdocker inspect -f '{{.State.Running}}' %s", sudo, containerName))
 	if err != nil || strings.TrimSpace(stdout) != "true" {
 		// Get container logs for diagnostics.
-		logs, _, _ := SSHRunCommand(client, fmt.Sprintf("sudo docker logs --tail 20 %s 2>&1", containerName))
+		logs, _, _ := sshRunWithPath(client, osType, fmt.Sprintf("%sdocker logs --tail 20 %s 2>&1", sudo, containerName))
 		logFn(fmt.Sprintf("[%s] WARNING: Container may not be running. Logs: %s", party, logs))
 		return fmt.Errorf("container not running after start")
 	}
@@ -134,16 +222,27 @@ func DeployParty(client *ssh.Client, party string, cfg *config.Config, cert, key
 }
 
 // ensureDocker checks if Docker is installed and installs it if not.
-func ensureDocker(client *ssh.Client, logFn func(string), party string) error {
-	_, _, err := SSHRunCommand(client, "docker --version")
+func ensureDocker(client *ssh.Client, logFn func(string), party string, osType string) error {
+	_, _, err := sshRunWithPath(client, osType, "docker --version")
 	if err == nil {
+		// Verify daemon is actually running (Docker Desktop on macOS might be stopped).
+		if osType == "darwin" {
+			_, _, daemonErr := sshRunWithPath(client, osType, "docker info >/dev/null 2>&1")
+			if daemonErr != nil {
+				return fmt.Errorf("Docker is installed but not running. Please start Docker Desktop and try again")
+			}
+		}
 		logFn(fmt.Sprintf("[%s] Docker is already installed.", party))
 		return nil
 	}
 
+	if osType == "darwin" {
+		return fmt.Errorf("Docker is not installed on this macOS server. Please install Docker Desktop (https://docker.com/products/docker-desktop) or run: brew install --cask docker — then start Docker Desktop and try again")
+	}
+
+	// Linux install path.
 	logFn(fmt.Sprintf("[%s] Docker not found, installing...", party))
 
-	// Detect the OS and install Docker accordingly.
 	osRelease, _, _ := SSHRunCommand(client, "cat /etc/os-release 2>/dev/null || cat /etc/redhat-release 2>/dev/null || echo unknown")
 
 	var installCmd string
@@ -159,7 +258,6 @@ func ensureDocker(client *ssh.Client, logFn func(string), party string) error {
 			`sudo yum install -y docker-ce docker-ce-cli containerd.io && ` +
 			`sudo systemctl start docker && sudo systemctl enable docker`
 	default:
-		// Fallback to the convenience script.
 		installCmd = `curl -fsSL https://get.docker.com | sudo sh`
 	}
 
@@ -169,7 +267,6 @@ func ensureDocker(client *ssh.Client, logFn func(string), party string) error {
 		return fmt.Errorf("install docker: stdout=%s stderr=%s: %w", stdout, stderr, err)
 	}
 
-	// Verify Docker is now available.
 	_, _, err = SSHRunCommand(client, "sudo docker --version")
 	if err != nil {
 		return fmt.Errorf("docker not available after install: %w", err)
@@ -180,20 +277,27 @@ func ensureDocker(client *ssh.Client, logFn func(string), party string) error {
 }
 
 // buildFromSource clones the repo and builds the Docker image on the remote server.
-func buildFromSource(client *ssh.Client, party string, logFn func(string)) error {
+func buildFromSource(client *ssh.Client, party string, logFn func(string), osType string) error {
 	logFn(fmt.Sprintf("[%s] Cloning source repository...", party))
 
+	sudo := sudoPrefix(osType)
+	gitInstall := "sudo apt-get install -y -qq git 2>/dev/null || sudo yum install -y git 2>/dev/null || true"
+	if osType == "darwin" {
+		// macOS: git comes with Xcode CLI tools, or install via brew.
+		gitInstall = "which git || xcode-select --install 2>/dev/null || brew install git || true"
+	}
+
 	commands := []string{
-		"sudo apt-get install -y -qq git 2>/dev/null || sudo yum install -y git 2>/dev/null || true",
+		gitInstall,
 		"rm -rf /tmp/crypto-claw-build",
 		"git clone --depth 1 https://github.com/seeingred/crypto-claw.git /tmp/crypto-claw-build",
-		fmt.Sprintf("cd /tmp/crypto-claw-build && sudo docker build -t crypto-claw-party-%s:latest -f docker/Dockerfile.party-%s .", party, party),
+		fmt.Sprintf("cd /tmp/crypto-claw-build && %sdocker build -t crypto-claw-party-%s:latest -f docker/Dockerfile.party-%s .", sudo, party, party),
 		"rm -rf /tmp/crypto-claw-build",
 	}
 
 	for _, cmd := range commands {
 		logFn(fmt.Sprintf("[%s] %s", party, cmd))
-		stdout, stderr, err := SSHRunCommand(client, cmd)
+		stdout, stderr, err := sshRunWithPath(client, osType, cmd)
 		if err != nil {
 			return fmt.Errorf("command %q: stdout=%s stderr=%s: %w", cmd, stdout, stderr, err)
 		}
@@ -407,9 +511,9 @@ func buildLocalDockerConfig(state *WizardState, party string) *config.Config {
 			ListenAddr: partyAAddr,
 		}
 		// Party A connects to Party B via host network.
-		cfg.Transport.RemoteAddr = "host.docker.internal:9000"
+		cfg.Transport.RemoteAddr = fmt.Sprintf("host.docker.internal:%d", state.GetTransportPort())
 	} else {
-		cfg.Transport.ListenAddr = "0.0.0.0:9000"
+		cfg.Transport.ListenAddr = fmt.Sprintf("0.0.0.0:%d", state.GetTransportPort())
 
 		// Rewrite localhost LLM endpoint to host.docker.internal so the
 		// container can reach the host-side Ollama/vLLM.
@@ -789,6 +893,51 @@ func ensureDockerPostgresDatabases(logFn func(string)) error {
 	return nil
 }
 
+// ensureRemotePostgres ensures a PostgreSQL Docker container is running on the remote server.
+func ensureRemotePostgres(client *ssh.Client, party string, sudo string, osType string, logFn func(string)) error {
+	pgContainer := fmt.Sprintf("crypto-claw-postgres-%s", party)
+	dbName := fmt.Sprintf("crypto_claw_%s", party)
+
+	// Check if our PG container is already running.
+	out, _, _ := sshRunWithPath(client, osType, fmt.Sprintf("%sdocker inspect -f '{{.State.Running}}' %s 2>/dev/null", sudo, pgContainer))
+	if strings.TrimSpace(out) == "true" {
+		logFn(fmt.Sprintf("[%s] PostgreSQL container already running.", party))
+		return nil
+	}
+
+	// Remove stopped container if it exists.
+	sshRunWithPath(client, osType, fmt.Sprintf("%sdocker rm %s 2>/dev/null", sudo, pgContainer))
+
+	// Start PostgreSQL container.
+	logFn(fmt.Sprintf("[%s] Starting PostgreSQL container...", party))
+	runCmd := fmt.Sprintf(
+		"%sdocker run -d --name %s "+
+			"-p 5432:5432 "+
+			"-e POSTGRES_USER=crypto_claw "+
+			"-e POSTGRES_PASSWORD=crypto_claw "+
+			"-e POSTGRES_DB=%s "+
+			"--restart unless-stopped "+
+			"postgres:16-alpine",
+		sudo, pgContainer, dbName,
+	)
+	out, stderr, err := sshRunWithPath(client, osType, runCmd)
+	if err != nil {
+		return fmt.Errorf("start postgres container: %s %s: %w", out, stderr, err)
+	}
+
+	// Wait for it to be ready.
+	logFn(fmt.Sprintf("[%s] Waiting for PostgreSQL to be ready...", party))
+	for i := 0; i < 30; i++ {
+		_, _, err := sshRunWithPath(client, osType, fmt.Sprintf("%sdocker exec %s pg_isready -U crypto_claw", sudo, pgContainer))
+		if err == nil {
+			logFn(fmt.Sprintf("[%s] PostgreSQL is ready.", party))
+			return nil
+		}
+		time.Sleep(1 * time.Second)
+	}
+	return fmt.Errorf("PostgreSQL container failed to become ready within 30s")
+}
+
 // buildPartyConfig creates a config.Config for the given party.
 func buildPartyConfig(state *WizardState, party string, certDir string) *config.Config {
 	cfg := &config.Config{
@@ -811,21 +960,27 @@ func buildPartyConfig(state *WizardState, party string, certDir string) *config.
 
 	if party == "a" {
 		partyAAddr := state.PartyAAddr
-		if partyAAddr == "" {
-			partyAAddr = "127.0.0.1:8080"
+		if partyAAddr == "" || strings.HasPrefix(partyAAddr, "127.0.0.1:") {
+			// Inside a container, must bind to 0.0.0.0 to be reachable via port mapping.
+			port := "8080"
+			if parts := strings.SplitN(partyAAddr, ":", 2); len(parts) == 2 {
+				port = parts[1]
+			}
+			partyAAddr = "0.0.0.0:" + port
 		}
 		cfg.API = config.APIConfig{
 			ListenAddr: partyAAddr,
 		}
 		// Party A connects to Party B.
+		tport := state.GetTransportPort()
 		if state.LocalMode {
-			cfg.Transport.RemoteAddr = "127.0.0.1:9000"
+			cfg.Transport.RemoteAddr = fmt.Sprintf("127.0.0.1:%d", tport)
 		} else {
-			cfg.Transport.RemoteAddr = fmt.Sprintf("%s:9000", state.ServerB.Host)
+			cfg.Transport.RemoteAddr = fmt.Sprintf("%s:%d", state.ServerB.Host, tport)
 		}
 	} else {
 		// Party B listens for connections.
-		cfg.Transport.ListenAddr = "0.0.0.0:9000"
+		cfg.Transport.ListenAddr = fmt.Sprintf("0.0.0.0:%d", state.GetTransportPort())
 		cfg.Analyzer = config.AnalyzerConfig{
 			DisableAI: state.DisableAI,
 			LLM: config.LLMConfig{

@@ -11,6 +11,8 @@ A 2-of-2 Multi-Party Computation Threshold Signature Scheme (MPC-TSS) service th
 ```bash
 # Build the frontend (requires Node.js 18+)
 cd installer/ui && npm install && npm run build && cd ../..
+
+# Copy built assets into the Go embed directory (required — Go embeds from cmd/installer/ui/dist/)
 cp -r installer/ui/dist/* cmd/installer/ui/dist/
 
 # Run the installer
@@ -93,14 +95,21 @@ tests/
 The installer runs on your local machine (not on either server) and guides you through the full setup:
 
 1. **Welcome** — explains the two-server architecture
-2. **Server configuration** — SSH access to both servers (password or key auth), with optional localhost mode for testing
-3. **Key generation (DKG)** — generates ECDSA (secp256k1) and EdDSA (ed25519) master keys via 2-of-2 DKG ceremony
-4. **LLM setup** — configure OpenAI, Anthropic, or a local model endpoint for the TX analyzer, or skip to use deterministic checks + whitelist only
-5. **Telegram bot** — instructions for BotFather, prompts for bot token
-6. **Telegram authorization** — waits for the first message to verify user identity
-7. **Review** — displays all settings before deployment
-8. **Deployment** — deploys Docker containers to both servers via SSH with live logs
-9. **Done** — shows completion status and link to the Party A web UI
+2. **Server configuration** — SSH access to both servers (password or SSH key auth), configurable mTLS transport port (default 443), with optional localhost mode for testing
+3. **LLM setup** — configure OpenAI, Anthropic, or a local model endpoint for the TX analyzer, or skip to use deterministic checks + whitelist only
+4. **Telegram bot** — instructions for BotFather, prompts for bot token
+5. **Review** — displays all settings before deployment
+6. **Install** — generates a BIP-39 mnemonic (or accepts an existing one for restore), runs 2-of-2 DKG to produce ECDSA (secp256k1) and EdDSA (ed25519) master key shares, provisions PostgreSQL, deploys Docker containers to both servers via SSH with live logs
+7. **Done** — shows completion status and link to the Party A web UI
+
+### Deployment features
+
+- **macOS + Linux support** — the installer detects the remote OS and adapts: config paths (`~/Library/crypto-claw` on macOS vs `/etc/crypto-claw` on Linux), Docker networking (`host.docker.internal` on macOS vs `--network host` on Linux), sudo usage (skipped on macOS)
+- **SSH key upload** — drag-and-drop or file picker for SSH private keys (uploaded to the installer backend, stored in a temp file for the session)
+- **Configurable transport port** — the mTLS port between Party A and Party B defaults to 443; useful when non-standard ports are blocked by ISPs or hosting providers
+- **Automatic PostgreSQL** — the installer provisions a `postgres:16-alpine` container on each remote server and imports key shares via SSH tunnel
+- **Docker image fallback** — if the pre-built Docker image can't be pulled, the installer clones the repo on the remote server and builds from source
+- **macOS Docker requirement** — Docker Desktop must be installed and running before deployment; the installer checks and blocks with instructions if missing (it does not auto-install Docker on macOS)
 
 ### Uninstalling
 
@@ -113,9 +122,9 @@ Connects to both servers, stops and removes Docker containers and images, cleans
 ## Prerequisites
 
 - Go 1.21+
-- PostgreSQL (for encrypted key share storage)
-- Docker (for deployment)
+- Docker on target servers (Docker Desktop on macOS, Docker Engine on Linux)
 - Node.js 18+ (for building the installer UI and Hardhat integration tests)
+- PostgreSQL is provisioned automatically during deployment (no manual setup needed)
 
 ## Configuration
 

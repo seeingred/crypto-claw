@@ -5,8 +5,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -42,6 +45,7 @@ func registerAPIRoutes(mux *http.ServeMux, state *WizardState) {
 	mux.HandleFunc("GET /api/state", handleState(state))
 	mux.HandleFunc("GET /api/preflight", handlePreflight(state))
 	mux.HandleFunc("POST /api/localhost/setup", handleLocalhostSetup(state))
+	mux.HandleFunc("POST /api/ssh-key/upload", handleSSHKeyUpload())
 }
 
 // writeJSON writes a JSON response with the given status code.
@@ -105,9 +109,10 @@ func handleServersTest(state *WizardState) http.HandlerFunc {
 func handleServersSave(state *WizardState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			ServerA   SSHConfig `json:"serverA"`
-			ServerB   SSHConfig `json:"serverB"`
-			LocalMode bool      `json:"localMode"`
+			ServerA       SSHConfig `json:"serverA"`
+			ServerB       SSHConfig `json:"serverB"`
+			LocalMode     bool      `json:"localMode"`
+			TransportPort int       `json:"transportPort"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
@@ -116,6 +121,7 @@ func handleServersSave(state *WizardState) http.HandlerFunc {
 
 		state.mu.Lock()
 		state.LocalMode = req.LocalMode
+		state.TransportPort = req.TransportPort
 		if req.LocalMode {
 			state.ServerA = SSHConfig{Host: "127.0.0.1", Port: 22, User: "local"}
 			state.ServerB = SSHConfig{Host: "127.0.0.1", Port: 22, User: "local"}
@@ -1150,7 +1156,8 @@ func deployRemote(state *WizardState, logFn func(string)) error {
 	}
 	defer clientB.Close()
 
-	certDirB := "/etc/crypto-claw"
+	osB := remoteOS(clientB)
+	certDirB := remoteConfigPath(osB, clientB)
 	cfgB := buildPartyConfig(state, "b", certDirB)
 	if err := DeployParty(clientB, "b", cfgB, certB, keyB, caCert, logFn); err != nil {
 		logFn(fmt.Sprintf("ERROR: deploy Party B: %v", err))
@@ -1166,23 +1173,24 @@ func deployRemote(state *WizardState, logFn func(string)) error {
 	}
 	defer clientA.Close()
 
-	certDirA := "/etc/crypto-claw"
+	osA := remoteOS(clientA)
+	certDirA := remoteConfigPath(osA, clientA)
 	cfgA := buildPartyConfig(state, "a", certDirA)
 	if err := DeployParty(clientA, "a", cfgA, certA, keyA, caCert, logFn); err != nil {
 		logFn(fmt.Sprintf("ERROR: deploy Party A: %v", err))
 		return fmt.Errorf("deploy Party A: %w", err)
 	}
 
-	// Upload key shares to both servers.
+	// Upload key shares and import into remote databases.
 	logFn("Uploading key shares...")
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		errA = uploadKeyShares(clientA, state, "a")
+		errA = uploadKeyShares(clientA, state, "a", certDirA)
 	}()
 	go func() {
 		defer wg.Done()
-		errB = uploadKeyShares(clientB, state, "b")
+		errB = uploadKeyShares(clientB, state, "b", certDirB)
 	}()
 	wg.Wait()
 
@@ -1195,12 +1203,104 @@ func deployRemote(state *WizardState, logFn func(string)) error {
 		return errB
 	}
 
+	// Import key shares into remote PostgreSQL databases via SSH tunnel.
+	logFn("Importing key shares into databases...")
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		errA = importRemoteShares(clientA, state, "a", certDirA, osA, logFn)
+	}()
+	go func() {
+		defer wg.Done()
+		errB = importRemoteShares(clientB, state, "b", certDirB, osB, logFn)
+	}()
+	wg.Wait()
+
+	if errA != nil {
+		logFn(fmt.Sprintf("ERROR: import shares Party A: %v", errA))
+		return errA
+	}
+	if errB != nil {
+		logFn(fmt.Sprintf("ERROR: import shares Party B: %v", errB))
+		return errB
+	}
+
 	logFn("Remote deployment complete.")
 	return nil
 }
 
+// importRemoteShares imports key shares into the remote PostgreSQL via SSH tunnel.
+func importRemoteShares(client *ssh.Client, state *WizardState, party string, cfgDir string, osType string, logFn func(string)) error {
+	// Open an SSH tunnel to the remote PostgreSQL (localhost:5432 on the remote).
+	tunnel, err := client.Dial("tcp", "127.0.0.1:5432")
+	if err != nil {
+		return fmt.Errorf("SSH tunnel to remote postgres: %w", err)
+	}
+	defer tunnel.Close()
+
+	// Start a local listener that forwards to the tunnel.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return fmt.Errorf("local listener: %w", err)
+	}
+	defer ln.Close()
+	localPort := ln.Addr().(*net.TCPAddr).Port
+
+	// Forward one connection.
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go func() {
+			defer conn.Close()
+			defer tunnel.Close()
+			done := make(chan struct{}, 2)
+			go func() { io.Copy(tunnel, conn); done <- struct{}{} }()
+			go func() { io.Copy(conn, tunnel); done <- struct{}{} }()
+			<-done
+		}()
+	}()
+
+	dsn := fmt.Sprintf("postgres://crypto_claw:crypto_claw@127.0.0.1:%d/crypto_claw_%s?sslmode=disable", localPort, party)
+
+	// Write share files to a temp dir locally, then import.
+	tmpDir, err := os.MkdirTemp("", "claw-import-*")
+	if err != nil {
+		return fmt.Errorf("create temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	state.mu.Lock()
+	var ecdsaShare, eddsaShare *tss.KeyShare
+	if party == "a" {
+		ecdsaShare = state.ShareA
+		eddsaShare = state.EdShareA
+	} else {
+		ecdsaShare = state.ShareB
+		eddsaShare = state.EdShareB
+	}
+	state.mu.Unlock()
+
+	if ecdsaShare != nil {
+		data, _ := json.Marshal(ecdsaShare)
+		os.WriteFile(filepath.Join(tmpDir, "ecdsa_share.json"), data, 0600)
+	}
+	if eddsaShare != nil {
+		data, _ := json.Marshal(eddsaShare)
+		os.WriteFile(filepath.Join(tmpDir, "eddsa_share.json"), data, 0600)
+	}
+
+	if err := importSharesToDB(dsn, tmpDir, logFn, party); err != nil {
+		return fmt.Errorf("import shares: %w", err)
+	}
+
+	logFn(fmt.Sprintf("[%s] Key shares imported into remote database.", party))
+	return nil
+}
+
 // uploadKeyShares uploads serialized key shares to a remote server.
-func uploadKeyShares(client *ssh.Client, state *WizardState, party string) error {
+func uploadKeyShares(client *ssh.Client, state *WizardState, party string, cfgDir string) error {
 	state.mu.Lock()
 	var ecdsaShare, eddsaShare *tss.KeyShare
 	if party == "a" {
@@ -1217,7 +1317,7 @@ func uploadKeyShares(client *ssh.Client, state *WizardState, party string) error
 		if err != nil {
 			return fmt.Errorf("marshal ECDSA share: %w", err)
 		}
-		if err := SSHUploadFile(client, data, filepath.Join(remoteConfigDir, "ecdsa_share.json")); err != nil {
+		if err := SSHUploadFile(client, data, filepath.Join(cfgDir, "ecdsa_share.json")); err != nil {
 			return fmt.Errorf("upload ECDSA share: %w", err)
 		}
 	}
@@ -1227,7 +1327,7 @@ func uploadKeyShares(client *ssh.Client, state *WizardState, party string) error
 		if err != nil {
 			return fmt.Errorf("marshal EdDSA share: %w", err)
 		}
-		if err := SSHUploadFile(client, data, filepath.Join(remoteConfigDir, "eddsa_share.json")); err != nil {
+		if err := SSHUploadFile(client, data, filepath.Join(cfgDir, "eddsa_share.json")); err != nil {
 			return fmt.Errorf("upload EdDSA share: %w", err)
 		}
 	}
@@ -1375,6 +1475,52 @@ func extractCoinTypeFromPath(path string) string {
 	ct := parts[1]
 	ct = strings.TrimRight(ct, "'hH")
 	return ct
+}
+
+// handleSSHKeyUpload accepts a multipart file upload and saves it to a temp file.
+// Returns the temp path so the frontend can reference it in SSH config.
+func handleSSHKeyUpload() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// 1 MB limit — SSH keys are tiny.
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+
+		file, _, err := r.FormFile("key")
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "missing 'key' file field: "+err.Error())
+			return
+		}
+		defer file.Close()
+
+		data, err := io.ReadAll(file)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "failed to read uploaded file: "+err.Error())
+			return
+		}
+
+		// Validate it's actually a parseable SSH private key.
+		if _, err := ssh.ParsePrivateKey(data); err != nil {
+			writeError(w, http.StatusBadRequest, "not a valid SSH private key: "+err.Error())
+			return
+		}
+
+		tmpFile, err := os.CreateTemp("", "claw-ssh-key-*")
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to create temp file: "+err.Error())
+			return
+		}
+		if _, err := tmpFile.Write(data); err != nil {
+			tmpFile.Close()
+			os.Remove(tmpFile.Name())
+			writeError(w, http.StatusInternalServerError, "failed to write temp file: "+err.Error())
+			return
+		}
+		tmpFile.Close()
+		os.Chmod(tmpFile.Name(), 0600)
+
+		writeJSON(w, http.StatusOK, map[string]string{
+			"path": tmpFile.Name(),
+		})
+	}
 }
 
 // detectLLMProvider guesses the provider from the API key format.

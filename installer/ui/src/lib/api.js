@@ -40,13 +40,14 @@ function toSSHConfig(s) {
   };
 }
 
-export async function saveServers(serverA, serverB, localMode) {
+export async function saveServers(serverA, serverB, localMode, transportPort) {
   return request('/servers/save', {
     method: 'POST',
     body: JSON.stringify({
       serverA: toSSHConfig(serverA),
       serverB: toSSHConfig(serverB),
       localMode,
+      transportPort: parseInt(transportPort, 10) || 443,
     }),
   });
 }
@@ -165,6 +166,20 @@ export async function fetchTokenAccounts(address, rpcUrl) {
     method: 'POST',
     body: JSON.stringify({ address, rpcUrl }),
   });
+}
+
+export async function uploadSSHKey(file) {
+  const form = new FormData();
+  form.append('key', file);
+  const response = await fetch(`${API_BASE}/ssh-key/upload`, {
+    method: 'POST',
+    body: form,
+  });
+  if (!response.ok) {
+    const errorBody = await response.text().catch(() => '');
+    throw new Error(`API error ${response.status}: ${errorBody || response.statusText}`);
+  }
+  return response.json();
 }
 
 export async function getState() {

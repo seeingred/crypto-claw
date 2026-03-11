@@ -41,6 +41,7 @@ const defaultState = {
       tested: false,
       connected: false,
     },
+    transportPort: '443',
   },
   disableAI: false,
   llm: {

@@ -61,7 +61,8 @@ type WizardState struct {
 	DeployFailed bool     `json:"deployFailed"`
 
 	// Party A configuration.
-	PartyAAddr string `json:"partyAAddr,omitempty"` // e.g., "127.0.0.1:8080"
+	PartyAAddr    string `json:"partyAAddr,omitempty"`    // e.g., "127.0.0.1:8080"
+	TransportPort int    `json:"transportPort,omitempty"` // Party B mTLS listen port (default 443)
 
 	// Pre-computed ECDSA parameters (Paillier safe primes).
 	// Generated in background on startup to avoid blocking install.
@@ -69,6 +70,14 @@ type WizardState struct {
 	preParamB     *keygen.LocalPreParams
 	preParamReady chan struct{} // closed when both are ready
 	preParamErr   error
+}
+
+// GetTransportPort returns the transport port, defaulting to 443.
+func (s *WizardState) GetTransportPort() int {
+	if s.TransportPort <= 0 {
+		return 443
+	}
+	return s.TransportPort
 }
 
 // SanitizedState returns a copy of the state safe for sending to the frontend
@@ -110,6 +119,7 @@ func (s *WizardState) SanitizedState() map[string]any {
 		"telegramUserId":      s.TelegramUserID,
 		"deployDone":         s.DeployDone,
 		"partyAAddr":         s.PartyAAddr,
+		"transportPort":      s.GetTransportPort(),
 	}
 }
 
